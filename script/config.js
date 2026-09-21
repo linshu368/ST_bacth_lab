@@ -1,0 +1,7 @@
+export const BATCH_LAB_CONFIG = [
+	{
+		BATCH_LAB_ALLOW_PRODUCTION_SOURCE: true,
+		BATCH_LAB_ENABLED: true,
+		BATCH_LAB_MODEL_KEY: '',
+	},
+];
