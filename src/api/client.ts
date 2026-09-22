@@ -49,6 +49,8 @@ const DB_STORE = 'state';
 const DB_STATE_KEY = 'csv-state-v2';
 const LOCAL_SOURCE_ENVIRONMENT = 'test';
 const DEFAULT_OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
+// 模型请求是主要耗时；有限并发可提高吞吐，同时避免瞬间压垮模型供应商。
+const MAX_CONCURRENT_MODEL_REQUESTS = 6;
 
 const DEFAULT_SAMPLE_SQL = `SELECT h.id AS source_history_id
 FROM experience.chat_history AS h
@@ -621,33 +623,108 @@ async function claimAndRun(
   experimentId?: string
 ): Promise<BatchLabRunWorkerResult> {
   const tables = await loadTables();
-  const candidates = tables.attempts
-    .filter((item) => item.status === 'pending')
-    .filter((item) => !experimentId || item.experiment_id === experimentId)
-    .slice(0, claimLimit);
+  const candidates = selectRunnableAttempts(tables.attempts, claimLimit, experimentId);
   let completed = 0;
   let failed = 0;
+
+  // 批量领取后统一持久化，避免每条任务重复写入完整 IndexedDB 快照。
   for (const attempt of candidates) {
     attempt.status = 'running';
     attempt.lease_owner = workerId;
     attempt.started_at = now();
     attempt.attempt_count += 1;
-    refreshExperimentCounts(tables, attempt.experiment_id);
-    persistTables(tables);
+  }
+  for (const claimedExperimentId of new Set(candidates.map(item => item.experiment_id))) {
+    refreshExperimentCounts(tables, claimedExperimentId);
+  }
+  if (candidates.length > 0) persistTables(tables);
+
+  await runWithConcurrency(candidates, MAX_CONCURRENT_MODEL_REQUESTS, async attempt => {
     try {
       await runAttempt(tables, attempt);
       completed += 1;
     } catch (error) {
       attempt.status = 'failed';
-      attempt.error_code = error instanceof BatchLabClientError ? (error.code ?? error.kind) : 'error';
+      attempt.error_code =
+        error instanceof BatchLabClientError ? error.code ?? error.kind : 'error';
       attempt.error_message = error instanceof Error ? error.message : 'unknown error';
       attempt.completed_at = now();
+      // 当前轮失败后，依赖其输出的后续轮次不再具备可执行条件。
+      for (const dependent of tables.attempts) {
+        if (
+          dependent.status === 'pending' &&
+          dependent.experiment_id === attempt.experiment_id &&
+          dependent.sample_ordinal === attempt.sample_ordinal &&
+          dependent.variant_key === attempt.variant_key &&
+          dependent.turn_index > attempt.turn_index
+        ) {
+          dependent.status = 'blocked';
+          dependent.error_code = 'PREVIOUS_TURN_FAILED';
+          dependent.error_message = '前一轮执行失败，后续轮次已跳过';
+          dependent.completed_at = now();
+        }
+      }
       failed += 1;
     }
-    refreshExperimentCounts(tables, attempt.experiment_id);
-    persistTables(tables);
+  });
+
+  for (const claimedExperimentId of new Set(candidates.map(item => item.experiment_id))) {
+    refreshExperimentCounts(tables, claimedExperimentId);
   }
+  if (candidates.length > 0) persistTables(tables);
   return { claimed_count: candidates.length, completed_count: completed, failed_count: failed };
+}
+
+function selectRunnableAttempts(
+  attempts: AttemptRow[],
+  claimLimit: number,
+  experimentId?: string
+): AttemptRow[] {
+  const selected: AttemptRow[] = [];
+  const selectedChains = new Set<string>();
+
+  for (const attempt of attempts) {
+    if (attempt.status !== 'pending' || (experimentId && attempt.experiment_id !== experimentId)) {
+      continue;
+    }
+
+    // 后续轮次依赖前一轮输出，同一样本和变体每批只执行一个轮次。
+    const chainKey = `${attempt.experiment_id}:${attempt.sample_ordinal}:${attempt.variant_key}`;
+    if (selectedChains.has(chainKey)) continue;
+    const hasUnfinishedPreviousTurn = attempts.some(
+      item =>
+        item.experiment_id === attempt.experiment_id &&
+        item.sample_ordinal === attempt.sample_ordinal &&
+        item.variant_key === attempt.variant_key &&
+        item.turn_index < attempt.turn_index &&
+        item.status !== 'succeeded'
+    );
+    if (hasUnfinishedPreviousTurn) continue;
+
+    selected.push(attempt);
+    selectedChains.add(chainKey);
+    if (selected.length >= claimLimit) break;
+  }
+  return selected;
+}
+
+async function runWithConcurrency<T>(
+  items: T[],
+  concurrency: number,
+  run: (item: T) => Promise<void>
+): Promise<void> {
+  let nextIndex = 0;
+  const workerCount = Math.min(concurrency, items.length);
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      for (;;) {
+        const index = nextIndex;
+        nextIndex += 1;
+        if (index >= items.length) return;
+        await run(items[index]);
+      }
+    })
+  );
 }
 
 async function runAttempt(tables: Tables, attempt: AttemptRow): Promise<void> {
