@@ -1,4 +1,6 @@
 node_modules/
 dist/
-/script/config.js
 *.tsbuildinfo
+.env
+.env.*
+!.env.example

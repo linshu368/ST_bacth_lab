@@ -30,5 +30,13 @@ files for `data/bacth-lab/`.
 
 ## Config
 
-Model settings are read from `script/config.js`. Because this is a pure frontend app, any model key
-in that file is public to browser users after deployment.
+Runtime model settings are read from Vercel/Vite environment variables through `script/config.js`.
+Set these in Vercel Project Settings, or in local `.env.local`:
+
+```bash
+VITE_BATCH_LAB_MODEL_KEY=your_model_key
+VITE_BATCH_LAB_ENABLED=true
+VITE_BATCH_LAB_ALLOW_PRODUCTION_SOURCE=true
+```
+
+Because this is a pure frontend app, every `VITE_*` value is public to browser users after deployment.
