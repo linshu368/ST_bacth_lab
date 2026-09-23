@@ -79,6 +79,16 @@ body {
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
+.source-import-grid {
+  margin-top: 14px;
+}
+
+.source-import-grid .ant-btn {
+  width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .stats-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));

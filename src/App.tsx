@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useMemo, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type {
   BatchLabContext,
@@ -58,6 +58,7 @@ import {
   getBatchLabExperiment,
   getBatchLabExperimentResults,
   getBatchLabSampleSet,
+  importBatchLabSourceCsvFiles,
   listBatchLabExperiments,
   listBatchLabProcessors,
   listBatchLabSampleSetSamples,
@@ -131,6 +132,12 @@ type SampleFormValues = {
   sql: string;
 };
 
+type SourceCsvFiles = {
+  history: File | null;
+  sessions: File | null;
+  characters: File | null;
+};
+
 function formatDate(value: string | null): string {
   if (!value) return '-';
   return new Intl.DateTimeFormat('zh-CN', {
@@ -143,6 +150,10 @@ function formatDate(value: string | null): string {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : '操作失败';
+}
+
+function csvFileButtonLabel(file: File | null, fallback: string): string {
+  return file ? file.name : fallback;
 }
 
 function makeVariant(
@@ -285,7 +296,7 @@ function WorkbenchShell({
         />
       </Header>
       <Content className="app-content">
-        <CapabilityBanner context={context} />
+        {/* <CapabilityBanner context={context} /> */}
         <Space className="section-gap" wrap>
           <Button
             onClick={() =>
@@ -886,6 +897,14 @@ function SamplesPage({
   const [form] = Form.useForm<SampleFormValues>();
   const [preview, setPreview] = useState<BatchLabPreview | null>(null);
   const [selectedSampleSet, setSelectedSampleSet] = useState<BatchLabSampleSet | null>(null);
+  const [sourceCsvFiles, setSourceCsvFiles] = useState<SourceCsvFiles>({
+    history: null,
+    sessions: null,
+    characters: null,
+  });
+  const historyInputRef = useRef<HTMLInputElement>(null);
+  const sessionsInputRef = useRef<HTMLInputElement>(null);
+  const charactersInputRef = useRef<HTMLInputElement>(null);
   const defaultTemplate = templates[0];
 
   const templateOptions = templates.map((template) => ({
@@ -910,6 +929,26 @@ function SamplesPage({
       });
     },
     onSuccess: (value) => setPreview(value),
+    onError: (error) => message.error(errorMessage(error)),
+  });
+
+  const sourceImportMutation = useMutation({
+    mutationFn: () => {
+      if (!sourceCsvFiles.history || !sourceCsvFiles.sessions || !sourceCsvFiles.characters) {
+        throw new Error('请先选择 chat_history、chat_sessions 和 characters 三个 CSV 文件');
+      }
+      return importBatchLabSourceCsvFiles({
+        historyFile: sourceCsvFiles.history,
+        sessionsFile: sourceCsvFiles.sessions,
+        charactersFile: sourceCsvFiles.characters,
+      });
+    },
+    onSuccess: (result) => {
+      setPreview(null);
+      message.success(
+        `已导入 ${result.history_count} 条 history、${result.session_count} 条 session、${result.character_count} 条 character，可预览 ${result.previewable_history_count} 条 history`
+      );
+    },
     onError: (error) => message.error(errorMessage(error)),
   });
 
@@ -964,6 +1003,10 @@ function SamplesPage({
     setPreview(null);
   };
 
+  const selectSourceCsvFile = (key: keyof SourceCsvFiles, file: File | null) => {
+    setSourceCsvFiles((current) => ({ ...current, [key]: file }));
+  };
+
   return (
     <section className="section-gap">
       <div className="page-head">
@@ -974,6 +1017,69 @@ function SamplesPage({
           </Typography.Text>
         </div>
       </div>
+      <Card className="section-gap" title="运行时导入 data/resouce CSV">
+        <Alert
+          type="info"
+          showIcon
+          message="导入后会写入浏览器 IndexedDB，并覆盖 Samples 预览使用的 data/resouce 种子数据。静态站点无法直接写回仓库目录。"
+        />
+        <div className="form-grid three source-import-grid">
+          <input
+            ref={historyInputRef}
+            type="file"
+            accept=".csv,text/csv"
+            hidden
+            onChange={(event) => {
+              selectSourceCsvFile('history', event.target.files?.[0] ?? null);
+              event.target.value = '';
+            }}
+          />
+          <input
+            ref={sessionsInputRef}
+            type="file"
+            accept=".csv,text/csv"
+            hidden
+            onChange={(event) => {
+              selectSourceCsvFile('sessions', event.target.files?.[0] ?? null);
+              event.target.value = '';
+            }}
+          />
+          <input
+            ref={charactersInputRef}
+            type="file"
+            accept=".csv,text/csv"
+            hidden
+            onChange={(event) => {
+              selectSourceCsvFile('characters', event.target.files?.[0] ?? null);
+              event.target.value = '';
+            }}
+          />
+          <Button onClick={() => historyInputRef.current?.click()}>
+            {csvFileButtonLabel(sourceCsvFiles.history, '选择 chat_history_rows.csv')}
+          </Button>
+          <Button onClick={() => sessionsInputRef.current?.click()}>
+            {csvFileButtonLabel(sourceCsvFiles.sessions, '选择 chat_sessions_rows.csv')}
+          </Button>
+          <Button onClick={() => charactersInputRef.current?.click()}>
+            {csvFileButtonLabel(sourceCsvFiles.characters, '选择 characters_rows.csv')}
+          </Button>
+        </div>
+        <Space className="section-gap" wrap>
+          <Button
+            type="primary"
+            loading={sourceImportMutation.isPending}
+            disabled={
+              !sourceCsvFiles.history || !sourceCsvFiles.sessions || !sourceCsvFiles.characters
+            }
+            onClick={() => sourceImportMutation.mutate()}
+          >
+            导入到 IndexedDB
+          </Button>
+          <Typography.Text type="secondary">
+            导入完成后重新点击「预览抽样」，会使用刚导入的 history / session / characters。
+          </Typography.Text>
+        </Space>
+      </Card>
       <Table
         rowKey="id"
         loading={loading}
