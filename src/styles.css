@@ -83,6 +83,33 @@ body {
   margin-top: 14px;
 }
 
+.team-access {
+  width: min(460px, calc(100% - 32px));
+  margin: 12vh auto;
+}
+
+.dataset-name-field {
+  display: grid;
+  gap: 8px;
+  margin-top: 16px;
+  max-width: 520px;
+}
+
+.cursor-pagination,
+.version-lineage {
+  margin-bottom: 16px;
+}
+
+.event-data {
+  margin: 0;
+  max-width: 480px;
+  max-height: 200px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+
 .source-import-grid .ant-btn {
   width: 100%;
   overflow: hidden;

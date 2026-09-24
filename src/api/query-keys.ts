@@ -2,11 +2,15 @@
 
 export const batchLabQueryKeys = {
   context: ['batch-lab', 'context'] as const,
+  session: ['batch-lab', 'session'] as const,
   environment(context: BatchLabContext) {
     return ['batch-lab', context.backend_environment, context.source_environment] as const;
   },
   templates(context: BatchLabContext) {
     return [...this.environment(context), 'sql-templates'] as const;
+  },
+  datasets(context: BatchLabContext) {
+    return [...this.environment(context), 'datasets'] as const;
   },
   processors(context: BatchLabContext) {
     return [...this.environment(context), 'processors'] as const;
@@ -29,5 +33,7 @@ export const batchLabQueryKeys = {
   experimentResults(context: BatchLabContext, experimentId: string, cursor: string | null = null) {
     return [...this.experiment(context, experimentId), 'results', cursor ?? 'first'] as const;
   },
+  attemptEvents(context: BatchLabContext, experimentId: string) {
+    return [...this.experiment(context, experimentId), 'events'] as const;
+  },
 };
-

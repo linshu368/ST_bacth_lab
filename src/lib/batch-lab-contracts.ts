@@ -148,6 +148,7 @@ export const batchLabSqlTemplateListResponseSchema = z
 export const batchLabPreviewRequestSchema = z
   .object({
     source_environment: batchLabSourceEnvironmentSchema,
+    dataset_version_id: uuidSchema.optional(),
     template_key: batchLabSqlTemplateSchema.shape.key.nullable(),
     template_version: z.number().int().positive().nullable(),
     sql: z.string().trim().min(1).max(BATCH_LAB_MAX_SQL_LENGTH),
@@ -194,7 +195,7 @@ export const batchLabPreviewStatisticsSchema = z
     character_count: countSchema,
     excluded_by_reason: z.record(batchLabPreviewExclusionReasonSchema, countSchema),
     truncated: z.boolean(),
-    snapshot_bytes: z.number().int().min(0).max(BATCH_LAB_MAX_PREVIEW_BYTES),
+    snapshot_bytes: z.number().int().min(0),
   })
   .strict();
 export type BatchLabPreviewStatistics = z.infer<typeof batchLabPreviewStatisticsSchema>;
@@ -235,6 +236,9 @@ export type BatchLabPreviewItem = z.infer<typeof batchLabPreviewItemSchema>;
 export const batchLabPreviewSchema = z
   .object({
     id: uuidSchema,
+    dataset_version_id: uuidSchema.optional(),
+    dataset_version_name: z.string().optional(),
+    dataset_version_number: z.number().int().positive().optional(),
     digest: digestSchema,
     source_environment: batchLabSourceEnvironmentSchema,
     final_sql: z.string().min(1).max(BATCH_LAB_MAX_SQL_LENGTH),
@@ -273,6 +277,10 @@ export type BatchLabCreateSampleSetRequest = z.infer<typeof batchLabCreateSample
 export const batchLabSampleSetSchema = z
   .object({
     id: uuidSchema,
+    version: z.number().int().positive().optional(),
+    dataset_version_id: uuidSchema.optional(),
+    dataset_version_name: z.string().optional(),
+    dataset_version_number: z.number().int().positive().optional(),
     name: z.string().min(1).max(BATCH_LAB_MAX_NAME_LENGTH),
     source_environment: batchLabSourceEnvironmentSchema,
     source_preview_id: uuidSchema,
@@ -317,7 +325,9 @@ export const batchLabSampleSetDetailResponseSchema = z
   .object({ success: z.literal(true), data: batchLabSampleSetDetailSchema })
   .strict();
 
-export const batchLabSampleSnapshotSchema = batchLabPreviewItemSchema;
+export const batchLabSampleSnapshotSchema = batchLabPreviewItemSchema.extend({
+  preview_truncated: z.boolean().optional(),
+});
 export type BatchLabSampleSnapshot = z.infer<typeof batchLabSampleSnapshotSchema>;
 
 export const batchLabSampleSnapshotPageSchema = z
@@ -576,6 +586,8 @@ export const batchLabDeleteExperimentResponseSchema = z
 export const batchLabExperimentSummarySchema = z
   .object({
     id: uuidSchema,
+    sample_set_version: z.number().int().positive().optional(),
+    dataset_version_id: uuidSchema.optional(),
     name: z.string().min(1).max(BATCH_LAB_MAX_NAME_LENGTH),
     sample_set_id: uuidSchema,
     source_environment: batchLabSourceEnvironmentSchema,
@@ -737,6 +749,7 @@ export const batchLabResultAttemptSchema = batchLabExportAttemptSchema
   .extend({
     sample_ordinal: z.number().int().nonnegative(),
     display_result: batchLabDisplayResultSchema.nullable(),
+    preview_truncated: z.boolean().optional(),
   })
   .strict();
 export type BatchLabResultAttempt = z.infer<typeof batchLabResultAttemptSchema>;
