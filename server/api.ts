@@ -1,11 +1,11 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { z } from 'zod';
-import { datasetOperation } from './datasets';
-import { sampleOperation } from './samples';
-import { experimentOperation } from './experiments';
-import { processorOperation, ensureDefaultProcessors } from './processors';
-import { query } from './db';
+import { datasetOperation } from './datasets.js';
+import { sampleOperation } from './samples.js';
+import { experimentOperation } from './experiments.js';
+import { processorOperation, ensureDefaultProcessors } from './processors.js';
+import { query } from './db.js';
 
 function equal(a:string,b:string) { const x=Buffer.from(a),y=Buffer.from(b);return x.length===y.length && timingSafeEqual(x,y); }
 function signature(expires:string,key:string){return createHmac('sha256',key).update(`batch-lab:${expires}`).digest('hex');}

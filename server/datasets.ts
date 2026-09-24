@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import Papa from 'papaparse';
 import { z } from 'zod';
-import { query } from './db';
+import { query } from './db.js';
 
 export const SOURCE_KINDS = ['history', 'sessions', 'characters'] as const;
 export const CHUNK_BYTES = 512 * 1024;

@@ -1,9 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { z } from 'zod';
-import { query, transaction } from './db';
-import { requireDataset } from './datasets';
-import { compileDatasetQuery } from './sql';
-import { batchLabPreviewItemSchema, type BatchLabPreviewItem } from '../src/lib/batch-lab-contracts';
+import { query, transaction } from './db.js';
+import { requireDataset } from './datasets.js';
+import { compileDatasetQuery } from './sql.js';
+import { batchLabPreviewItemSchema, type BatchLabPreviewItem } from '../src/lib/batch-lab-contracts.js';
 
 export const DEFAULT_SAMPLE_SQL = `SELECT h.id AS source_history_id
 FROM experience.chat_history AS h
