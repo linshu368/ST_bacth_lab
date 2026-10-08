@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import Papa from 'papaparse';
 import {
   bytesToBase64,
   rpc,
@@ -8,6 +9,8 @@ import {
   getBatchLabExperimentResults,
   listBatchLabAttemptEvents,
   runBatchLabExperimentWorkerOnce,
+  importBatchLabSourceCsvFiles,
+  tableRowsToCsv,
 } from './client';
 import { createExperimentService } from '../../server/experiments';
 
@@ -17,6 +20,40 @@ const EXPERIMENT_B = '328aefcd-2e0d-49f2-a779-fb5d453dc083';
 function success(data: unknown): Response {
   return new Response(JSON.stringify({ success: true, data }), { status: 200 });
 }
+
+test('source upload sends only history and characters and preserves both original files', async () => {
+  const previous=globalThis.fetch;
+  const files={history:new File(['id,user_input\n1,你好\n'],'history.csv'),characters:new File(['id,name\n2,角色\n'],'characters.csv')};
+  const chunks:Record<string,Buffer[]>={history:[],characters:[]};
+  let manifest:any[]=[];
+  globalThis.fetch=async(_url,init)=>{
+    const {op,input}=JSON.parse(String(init?.body));
+    if(op==='beginDatasetImport') {
+      manifest=input.files;
+      assert.deepEqual(manifest.map(file=>file.kind),['history','characters']);
+      return success({id:EXPERIMENT_A});
+    }
+    if(op==='uploadDatasetChunk') {
+      assert.ok(input.kind in chunks);
+      chunks[input.kind].push(Buffer.from(input.data,'base64'));
+      return success({});
+    }
+    assert.equal(op,'finishDatasetImport');
+    return success({history_count:1,session_count:0,character_count:1,dataset:{id:EXPERIMENT_A}});
+  };
+  try {
+    const result=await importBatchLabSourceCsvFiles({historyFile:files.history,charactersFile:files.characters});
+    assert.equal(result.history_count,1);
+    for(const kind of ['history','characters'] as const) assert.deepEqual(Buffer.concat(chunks[kind]),Buffer.from(await files[kind].arrayBuffer()));
+  } finally {globalThis.fetch=previous;}
+});
+
+test('CSV export keeps source lineage when older rows lack the new fields',()=>{
+  const versions={history:{dataset_version_id:EXPERIMENT_A},characters:{dataset_version_id:EXPERIMENT_B}};
+  const csv=tableRowsToCsv([{id:'legacy'},{id:'new',source_versions:versions}]);
+  const parsed=Papa.parse<Record<string,string>>(csv,{header:true}).data;
+  assert.deepEqual(JSON.parse(parsed[1].source_versions),versions);
+});
 
 test('chunk encoding round-trips Chinese CSV across byte boundaries',()=>{
   const original=new TextEncoder().encode('id,history\r\n1,"中文🙂多轮历史"\r\n'.repeat(30_000));

@@ -1,10 +1,10 @@
+import { evaluationOperation } from './evaluations.js';
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { z } from 'zod';
 import { datasetOperation } from './datasets.js';
 import { sampleOperation } from './samples.js';
 import { experimentOperation } from './experiments.js';
-import { processorOperation, ensureDefaultProcessors } from './processors.js';
 import { query } from './db.js';
 
 function equal(a:string,b:string) { const x=Buffer.from(a),y=Buffer.from(b);return x.length===y.length && timingSafeEqual(x,y); }
@@ -17,6 +17,7 @@ export function isAuthenticated(cookie:string,key=process.env.BATCH_LAB_ACCESS_K
 }
 
 export async function operation(op:string,input:any):Promise<unknown> {
+  if(op.startsWith('evaluation')) return evaluationOperation(op,input);
   if(op==='getBatchLabContext') {
     await query('SELECT 1');
     return {backend_environment:process.env.VERCEL_ENV==='production'?'production':'development',source_environment:'test',capabilities:{sample_preview:true,experiment_execution:!!(process.env.BATCH_LAB_MODEL_KEY || process.env.VITE_BATCH_LAB_MODEL_KEY)}};
@@ -24,14 +25,12 @@ export async function operation(op:string,input:any):Promise<unknown> {
   if(['listBatchLabDatasets','beginDatasetImport','uploadDatasetChunk','finishDatasetImport','getDatasetChunk'].includes(op)) return datasetOperation(op,input);
   if(['listBatchLabSqlTemplates','createBatchLabPreview','createBatchLabSampleSet','listBatchLabSampleSets','getBatchLabSampleSet','listBatchLabSampleSetSamples','deleteBatchLabSampleSet'].includes(op)) return sampleOperation(op,input);
   if(['listBatchLabProcessors','createBatchLabProcessor','previewBatchLabProcessor'].includes(op)) {
-    await ensureDefaultProcessors();
-    return processorOperation(op,input);
+    throw new Error('富文本后处理暂未开放');
   }
   if(op==='exportTable') {
     const sources:Record<string,string>={
       datasets:'SELECT id,version,name,status,manifest,counts,provenance,created_at FROM lab_datasets WHERE status=\'ready\' ORDER BY version',
       sample_set:"SELECT data FROM lab_records WHERE kind='sample_set' ORDER BY id",
-      processor:"SELECT data FROM lab_records WHERE kind='processor' ORDER BY id",
       experiment:"SELECT data FROM lab_records WHERE kind='experiment' ORDER BY id",
       snapshots:"SELECT sample_set_id,ordinal,data FROM lab_snapshots WHERE sample_set_id IN(SELECT id FROM lab_records WHERE kind='sample_set') ORDER BY sample_set_id,ordinal",
       attempts:'SELECT * FROM lab_attempts ORDER BY id',events:'SELECT * FROM lab_attempt_events ORDER BY id',

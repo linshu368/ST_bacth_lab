@@ -120,6 +120,26 @@ export const batchLabSqlParameterValueSchema = z.union([
 ]);
 export type BatchLabSqlParameterValue = z.infer<typeof batchLabSqlParameterValueSchema>;
 
+// SQL 中的每张逻辑表明确绑定一个不可变原始版本。
+export const batchLabSourceVersionSelectionSchema = z.object({
+  history: uuidSchema,
+  characters: uuidSchema,
+}).strict();
+export type BatchLabSourceVersionSelection = z.infer<typeof batchLabSourceVersionSelectionSchema>;
+
+export const batchLabSourceVersionReferenceSchema = z.object({
+  dataset_version_id: uuidSchema,
+  dataset_version_number: z.number().int().positive(),
+  dataset_version_name: z.string(),
+  row_count: countSchema,
+}).strict();
+export const batchLabSourceVersionsSchema = z.object({
+  history: batchLabSourceVersionReferenceSchema,
+  sessions: batchLabSourceVersionReferenceSchema.optional(), // 兼容已冻结的旧三表样本。
+  characters: batchLabSourceVersionReferenceSchema,
+}).strict();
+export type BatchLabSourceVersions = z.infer<typeof batchLabSourceVersionsSchema>;
+
 // SQL 模板模式
 export const batchLabSqlTemplateSchema = z
   .object({
@@ -149,6 +169,9 @@ export const batchLabPreviewRequestSchema = z
   .object({
     source_environment: batchLabSourceEnvironmentSchema,
     dataset_version_id: uuidSchema.optional(),
+    source_versions: batchLabSourceVersionSelectionSchema.optional(),
+    require_turn_models: z.boolean().optional(),
+    min_message_turns: z.number().int().positive().optional(),
     template_key: batchLabSqlTemplateSchema.shape.key.nullable(),
     template_version: z.number().int().positive().nullable(),
     sql: z.string().trim().min(1).max(BATCH_LAB_MAX_SQL_LENGTH),
@@ -162,6 +185,13 @@ export const batchLabPreviewRequestSchema = z
   })
   .strict()
   .superRefine((value, context) => {
+    if (!value.source_versions && !value.dataset_version_id) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ['source_versions'], message: '请先选择聊天和角色表的原始数据版本' });
+    }
+    if (value.source_versions && value.dataset_version_id &&
+      Object.values(value.source_versions).some(id => id !== value.dataset_version_id)) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ['source_versions'], message: '来源版本选择与旧版单版本参数冲突' });
+    }
     if ((value.template_key === null) !== (value.template_version === null)) {
       context.addIssue({
         code: z.ZodIssueCode.custom,
@@ -181,6 +211,8 @@ export const batchLabPreviewExclusionReasonSchema = z.enum([
   'missing_character',
   'invalid_anchor',
   'snapshot_too_large',
+  'missing_turn_models',
+  'insufficient_message_turns',
 ]);
 export type BatchLabPreviewExclusionReason = z.infer<typeof batchLabPreviewExclusionReasonSchema>;
 
@@ -212,9 +244,14 @@ export type BatchLabSnapshotMessage = z.infer<typeof batchLabSnapshotMessageSche
 // 预览项模式
 export const batchLabPreviewItemSchema = z
   .object({
+    turn_models: z.array(z.object({
+      turn_index: z.number().int().positive(), user_message_index: z.number().int().nonnegative(),
+      assistant_message_indices: z.array(z.number().int().nonnegative()), source_history_id: uuidSchema,
+      model: z.string().min(1), llm_model: z.string().nullable(),
+    })).optional(),
     ordinal: countSchema,
     source_history_id: uuidSchema,
-    source_session_id: uuidSchema,
+    source_session_id: uuidSchema.nullable(),
     source_user_id: uuidSchema,
     source_character_id: uuidSchema,
     turn_index: z.number().int().positive(),
@@ -236,6 +273,7 @@ export type BatchLabPreviewItem = z.infer<typeof batchLabPreviewItemSchema>;
 export const batchLabPreviewSchema = z
   .object({
     id: uuidSchema,
+    source_versions: batchLabSourceVersionsSchema.optional(),
     dataset_version_id: uuidSchema.optional(),
     dataset_version_name: z.string().optional(),
     dataset_version_number: z.number().int().positive().optional(),
@@ -277,6 +315,7 @@ export type BatchLabCreateSampleSetRequest = z.infer<typeof batchLabCreateSample
 export const batchLabSampleSetSchema = z
   .object({
     id: uuidSchema,
+    source_versions: batchLabSourceVersionsSchema.optional(),
     version: z.number().int().positive().optional(),
     dataset_version_id: uuidSchema.optional(),
     dataset_version_name: z.string().optional(),
@@ -477,7 +516,7 @@ export const batchLabProcessorPreviewResponseSchema = z
 
 export const BATCH_LAB_MAX_EXPERIMENT_VARIANTS = 2;
 export const BATCH_LAB_MAX_EXPERIMENT_TURNS = 5;
-export const BATCH_LAB_MAX_WORKER_CLAIM_LIMIT = 20;
+export const BATCH_LAB_MAX_WORKER_CLAIM_LIMIT = 100;
 
 export const batchLabExperimentRunModeSchema = z.enum(['single', 'multi_turn']);
 export type BatchLabExperimentRunMode = z.infer<typeof batchLabExperimentRunModeSchema>;
@@ -512,6 +551,8 @@ export type BatchLabProviderConfig = z.infer<typeof batchLabProviderConfigSchema
 
 export const batchLabExperimentVariantSchema = z
   .object({
+    generation_mode: z.enum(['generate', 'original']).optional(),
+    model_source: z.enum(['sample', 'custom']).optional(),
     key: z.string().regex(/^[a-z][a-z0-9_-]{0,31}$/),
     name: z.string().trim().min(1).max(BATCH_LAB_MAX_NAME_LENGTH),
     model_id: z.string().trim().min(1).max(200),
@@ -534,6 +575,10 @@ export const batchLabCreateExperimentRequestSchema = z
     source_environment: batchLabSourceEnvironmentSchema,
     purpose: z.string().trim().max(BATCH_LAB_MAX_PURPOSE_LENGTH).nullable().optional(),
     run_mode: batchLabExperimentRunModeSchema.optional(),
+    comparison_variable: z.enum(['instruction_prompt', 'model']).optional(),
+    concurrency: z.number().int().min(1).max(BATCH_LAB_MAX_WORKER_CLAIM_LIMIT).optional(),
+    sample_limit: z.number().int().min(1).max(BATCH_LAB_MAX_SAMPLE_LIMIT).optional(),
+    exclude_last_turn: z.boolean().optional(),
     output_preset: batchLabOutputPresetSchema.optional(),
     provider_config: batchLabProviderConfigSchema.optional(),
     variants: z
@@ -586,6 +631,7 @@ export const batchLabDeleteExperimentResponseSchema = z
 export const batchLabExperimentSummarySchema = z
   .object({
     id: uuidSchema,
+    source_versions: batchLabSourceVersionsSchema.optional(),
     sample_set_version: z.number().int().positive().optional(),
     dataset_version_id: uuidSchema.optional(),
     name: z.string().min(1).max(BATCH_LAB_MAX_NAME_LENGTH),
@@ -594,6 +640,11 @@ export const batchLabExperimentSummarySchema = z
     status: batchLabExperimentStatusSchema,
     purpose: z.string().max(BATCH_LAB_MAX_PURPOSE_LENGTH).nullable().optional(),
     run_mode: batchLabExperimentRunModeSchema.optional(),
+    comparison_variable: z.enum(['instruction_prompt', 'model']).optional(),
+    concurrency: z.number().int().min(1).max(BATCH_LAB_MAX_WORKER_CLAIM_LIMIT).optional(),
+    sample_limit: z.number().int().min(1).max(BATCH_LAB_MAX_SAMPLE_LIMIT).optional(),
+    selected_sample_ordinals: z.array(z.number().int().nonnegative()).max(BATCH_LAB_MAX_SAMPLE_LIMIT).optional(),
+    exclude_last_turn: z.boolean().optional(),
     output_preset: batchLabOutputPresetSchema.optional(),
     provider_config: batchLabProviderConfigSchema.optional(),
     variants: z
@@ -748,6 +799,8 @@ export type BatchLabExportRow = z.infer<typeof batchLabExportRowSchema>;
 export const batchLabResultAttemptSchema = batchLabExportAttemptSchema
   .extend({
     sample_ordinal: z.number().int().nonnegative(),
+    replay_user_input: z.string().optional(),
+    request_model: z.string().nullable().optional(),
     display_result: batchLabDisplayResultSchema.nullable(),
     preview_truncated: z.boolean().optional(),
   })
@@ -767,11 +820,15 @@ export type BatchLabExperimentProgressSummary = z.infer<
   typeof batchLabExperimentProgressSummarySchema
 >;
 
+const comparisonCountsSchema = z.object({ total: countSchema, a_wins: countSchema, b_wins: countSchema,
+  ties: countSchema, unrated: countSchema, awaiting_results: countSchema });
+
 export const batchLabExperimentResultDetailSchema = z
   .object({
     experiment: batchLabExperimentDetailSchema,
+    comparison_summary: comparisonCountsSchema.extend({ by_model: z.array(comparisonCountsSchema.extend({ model_a: z.string(), model_b: z.string() })) }).optional(),
     sample_set: batchLabSampleSetDetailSchema,
-    samples: z.array(batchLabSampleSnapshotSchema).max(BATCH_LAB_MAX_SAMPLE_LIMIT),
+    samples: z.array(batchLabSampleSnapshotSchema.extend({ replay_start_index: z.number().int().nonnegative().optional() })).max(BATCH_LAB_MAX_SAMPLE_LIMIT),
     attempts: z.array(batchLabResultAttemptSchema),
     annotations: z.array(batchLabAnnotationSchema),
     progress: batchLabExperimentProgressSummarySchema,

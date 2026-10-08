@@ -15,7 +15,6 @@ const metadataSchema = z.object({
 }).strict();
 const definitions = [
   { kind: 'history', directory: 'history', pattern: /^page-\d+\.jsonl$/, csv: 'chat_history_rows.csv' },
-  { kind: 'sessions', directory: 'relations', pattern: /^sessions-\d+\.jsonl$/, csv: 'chat_sessions_rows.csv' },
   { kind: 'characters', directory: 'relations', pattern: /^characters-\d+\.jsonl$/, csv: 'characters_rows.csv' },
 ] as const;
 
@@ -75,7 +74,7 @@ export async function convertJsonlSource(sourceDirectory: string, outputDirector
     files.push({ kind: definition.kind, path: definition.csv });
   }
   const manifestPath = path.join(outputDirectory, 'manifest.json');
-  // Publish the manifest only after all three complete files are present.
+  // Publish only the two required originals; legacy session pages are left untouched.
   await writeFile(`${manifestPath}.tmp`, JSON.stringify({ ...metadata, files }, null, 2) + '\n', { mode: 0o600 });
   await rename(`${manifestPath}.tmp`, manifestPath);
   const verified = await prepareSourceImport(manifestPath);
@@ -97,6 +96,6 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     process.exitCode = 1;
   } else {
     try { console.log(JSON.stringify(await convertJsonlSource(source, output, metadata, { charactersDirectory }))); }
-    catch { console.error('JSONL 转换未完成，请核对三个表的分页、行数及来源清单。'); process.exitCode = 1; }
+    catch { console.error('JSONL 转换未完成，请核对聊天记录和角色两个表的分页、行数及来源清单。'); process.exitCode = 1; }
   }
 }

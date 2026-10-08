@@ -224,6 +224,31 @@ body {
   vertical-align: top;
 }
 
+.source-table-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  margin: 16px 0;
+}
+
+.source-table-choice {
+  padding: 16px;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  min-width: 0;
+}
+
+.source-table-name {
+  display: block;
+  margin: 6px 0 14px;
+  overflow-wrap: anywhere;
+}
+
+.source-table-scope,
+.source-version-summary {
+  overflow-wrap: anywhere;
+}
+
 @media (max-width: 780px) {
   .app-header {
     height: auto;
@@ -252,7 +277,22 @@ body {
 
   .form-grid.two,
   .form-grid.three,
+  .source-table-grid,
   .stats-grid {
     grid-template-columns: 1fr;
   }
 }
+
+.conversation-messages { display: flex; flex-direction: column; gap: 14px; width: 100%; min-width: 0; }
+.conversation-turn-heading { display: flex; align-items: center; gap: 12px; margin: 12px 0 0; font-size: 15px; font-weight: 700; color: #263c59; }
+.conversation-turn-heading::after { content: ''; flex: 1; height: 1px; background: #d9e2ef; }
+.conversation-message { width: 94%; min-width: 0; padding: 14px 16px; border: 1px solid #e0e5eb; border-radius: 12px; box-sizing: border-box; }
+.conversation-user { align-self: flex-end; background: #eef5ff; border-color: #cbdcf7; }
+.conversation-character { align-self: flex-start; background: #fafbfc; }
+.conversation-label { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 10px; font-size: 12px; color: #536278; }
+.conversation-label span { color: #738095; }
+.conversation-content { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.8; max-height: 480px; overflow-y: auto; }
+.conversation-system { padding: 12px 16px; background: #f3f1f8; border: 1px solid #dfd9ed; border-radius: 8px; }
+.conversation-system summary, .conversation-instruction summary { cursor: pointer; font-size: 13px; font-weight: 600; }
+.conversation-system[open] summary, .conversation-instruction[open] summary { margin-bottom: 12px; }
+.conversation-instruction { margin-bottom: 12px; color: #536278; }

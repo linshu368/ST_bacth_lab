@@ -1,6 +1,7 @@
 import { parse, toSql, type Expr, type SelectFromStatement, type Statement } from 'pgsql-ast-parser';
+import { batchLabSourceVersionSelectionSchema, type BatchLabSourceVersionSelection } from '../src/lib/batch-lab-contracts.js';
 
-type SourceKind = 'history' | 'sessions' | 'characters';
+type SourceKind = 'history' | 'characters';
 type ColumnType = 'text' | 'numeric' | 'timestamptz' | 'boolean';
 type Parameter = string | number | boolean | null;
 
@@ -12,10 +13,6 @@ const SOURCES: Record<SourceKind, { schema: string; table: string; cte: string; 
       'upstream_status deduction_rate llm_usage llm_usage_cache llm_native_tokens_cached llm_native_tokens_reasoning llm_native_tokens_completion llm_native_tokens_prompt llm_latency llm_generation_time llm_intended_deduction turn_index revision',
       'created_at llm_billing_settled_at',
     ),
-  },
-  sessions: {
-    schema: 'experience', table: 'chat_sessions', cte: '__lab_sessions',
-    columns: columns('id user_id character_id title last_message_preview', 'message_count context_window_start_turn', 'last_message_at deleted_at created_at updated_at pinned_at'),
   },
   characters: {
     schema: 'app_core', table: 'characters', cte: '__lab_characters',
@@ -187,7 +184,7 @@ function validateExpression(expr: Expr, aliases: SourceAlias[], parameterCount: 
   }
 }
 
-function sourceProjection(kind: SourceKind): string {
+function sourceProjection(kind: SourceKind, position: number): string {
   const source = SOURCES[kind];
   const historyAliases: Record<string, string> = {
     session_id: 'source_session_id', character_id: 'source_character_id',
@@ -202,25 +199,31 @@ function sourceProjection(kind: SourceKind): string {
       : `CASE WHEN pg_catalog.pg_input_is_valid(${value}, '${pgType}') THEN ${value}::${pgType} ELSE NULL END`;
     return `${expression} AS "${name}"`;
   });
-  return `"${source.cte}" AS (SELECT ${projections.join(', ')} FROM public.lab_source_rows WHERE dataset_id = $1::uuid AND kind = '${kind}')`;
+  return `"${source.cte}" AS (SELECT ${projections.join(', ')} FROM public.lab_source_rows WHERE dataset_id = $${position}::uuid AND kind = '${kind}')`;
 }
 
 /**
- * Compile a small, read-only SQL language against one immutable CSV version.
+ * Bind each logical table to its selected immutable CSV version.
  * The caller must still use a read-only DB transaction with a statement timeout.
  */
 export function compileDatasetQuery(input: {
-  datasetId: string;
+  datasetId?: string;
+  datasetIds?: BatchLabSourceVersionSelection;
   sql: string;
   parameters: Record<string, unknown>;
   sampleLimit: number;
 }): { text: string; values: unknown[] } {
-  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(input.datasetId)) invalid('原始数据版本 ID 格式不正确');
+  const selection = batchLabSourceVersionSelectionSchema.safeParse(input.datasetIds ??
+    { history: input.datasetId, characters: input.datasetId });
+  if (!selection.success) invalid('请为聊天记录和角色两张表分别指定有效的原始数据版本 ID');
+  const datasetIds = selection.data;
+  if (input.datasetId && Object.values(datasetIds).some(id => id !== input.datasetId)) invalid('两张表的版本选择与旧版单版本参数冲突');
   if (!Number.isInteger(input.sampleLimit) || input.sampleLimit < 1 || input.sampleLimit > 500) invalid('样本数量必须在 1 到 500 之间');
   if (typeof input.sql !== 'string' || !input.sql.trim() || input.sql.length > 20_000 || input.sql.includes('\0')) invalid('SQL 为空或超过 20000 字符');
   if (!input.parameters || typeof input.parameters !== 'object' || Array.isArray(input.parameters)) invalid('参数必须是对象');
 
-  const values: unknown[] = [input.datasetId];
+  const values: unknown[] = [...new Set(Object.values(datasetIds))];
+  const sourcePositions = Object.fromEntries(Object.entries(datasetIds).map(([kind,id]) => [kind,values.indexOf(id)+1])) as Record<SourceKind,number>;
   const boundSql = bindNamedParameters(input.sql, input.parameters, values);
   let statements: Statement[];
   try { statements = parse(boundSql); } catch { invalid('请检查 SQL 语法；当前支持 SELECT、JOIN、WHERE、ORDER BY 和 LIMIT'); }
@@ -236,12 +239,12 @@ export function compileDatasetQuery(input: {
 
   const aliases: SourceAlias[] = [];
   const from = statement.from.map(item => {
-    if (item.type !== 'table') invalid('FROM 仅支持三张原始数据表，不支持函数或子查询');
+    if (item.type !== 'table') invalid('FROM 仅支持聊天记录和角色两张原始数据表，不支持函数或子查询');
     onlyKeys(item, ['type', 'name', 'join']);
     onlyKeys(item.name, ['name', 'schema', 'alias']);
     const entry = (Object.entries(SOURCES) as [SourceKind, typeof SOURCES[SourceKind]][])
       .find(([, source]) => item.name.name === source.table && (!item.name.schema || item.name.schema === source.schema));
-    if (!entry) invalid('只允许查询 experience.chat_history、experience.chat_sessions 和 app_core.characters');
+    if (!entry) invalid('只允许查询 experience.chat_history 和 app_core.characters');
     const [kind, source] = entry;
     const alias = item.name.alias ?? source.table;
     if (aliases.some(existing => existing.alias === alias)) invalid(`表别名 ${alias} 重复`);
@@ -271,6 +274,12 @@ export function compileDatasetQuery(input: {
     onlyKeys(order, ['by', 'order', 'nulls']);
     if (order.order && !['ASC', 'DESC'].includes(order.order)) invalid('排序方向无效');
     if (order.nulls && !['FIRST', 'LAST'].includes(order.nulls)) invalid('空值排序方式无效');
+    if (order.by.type === 'call') {
+      onlyKeys(order.by, ['type', 'function', 'args']);
+      onlyKeys(order.by.function, ['name', 'schema']);
+      if (order.by.function.name !== 'random' || (order.by.function.schema && order.by.function.schema !== 'pg_catalog') || order.by.args.length !== 0) invalid('排序函数仅支持无参数的 random()');
+      return { ...order, by: { ...order.by, function: { name: 'random', schema: 'pg_catalog' } } };
+    }
     return { ...order, by: validateExpression(order.by, aliases, values.length, true) };
   });
   if (statement.limit) {
@@ -282,7 +291,7 @@ export function compileDatasetQuery(input: {
   const querySql = toSql.statement(query);
   values.push(input.sampleLimit + 1);
   return {
-    text: `WITH ${(Object.keys(SOURCES) as SourceKind[]).map(sourceProjection).join(',\n')}\nSELECT "__lab_query"."source_history_id" FROM (${querySql}) AS "__lab_query" LIMIT $${values.length}`,
+    text: `WITH ${(Object.keys(SOURCES) as SourceKind[]).map(kind => sourceProjection(kind, sourcePositions[kind])).join(',\n')}\nSELECT "__lab_query"."source_history_id" FROM (${querySql}) AS "__lab_query" LIMIT $${values.length}`,
     values,
   };
 }

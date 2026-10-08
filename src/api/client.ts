@@ -1,4 +1,5 @@
 import Papa from 'papaparse';
+import { excludeLastTurn } from '../lib/replay-sample';
 import type * as C from '../lib/batch-lab-contracts';
 import type { DatasetVersion } from '../lib/datasets';
 
@@ -27,9 +28,6 @@ export const loginBatchLab = (accessKey:string) => rpc<void>('login',{accessKey}
 export const logoutBatchLab = () => rpc<void>('logout');
 export const getBatchLabContext = (signal?:AbortSignal) => rpc<C.BatchLabContext>('getBatchLabContext',{},signal);
 export const listBatchLabSqlTemplates = (signal?:AbortSignal) => rpc<C.BatchLabSqlTemplate[]>('listBatchLabSqlTemplates',{},signal);
-export const listBatchLabProcessors = (signal?:AbortSignal) => rpc<C.BatchLabProcessorVersion[]>('listBatchLabProcessors',{},signal);
-export const createBatchLabProcessor = (input:C.BatchLabCreateProcessorVersionRequest,signal?:AbortSignal) => rpc<C.BatchLabProcessorVersion>('createBatchLabProcessor',input,signal);
-export const previewBatchLabProcessor = (input:C.BatchLabProcessorPreviewRequest,signal?:AbortSignal) => rpc<C.BatchLabDisplayResult>('previewBatchLabProcessor',input,signal);
 export const createBatchLabPreview = (input:C.BatchLabPreviewRequest,signal?:AbortSignal) => rpc<C.BatchLabPreview>('createBatchLabPreview',input,signal);
 export const createBatchLabSampleSet = (input:C.BatchLabCreateSampleSetRequest,signal?:AbortSignal) => rpc<C.BatchLabSampleSet>('createBatchLabSampleSet',input,signal);
 export const listBatchLabSampleSets = (signal?:AbortSignal) => rpc<C.BatchLabSampleSet[]>('listBatchLabSampleSets',{},signal);
@@ -41,7 +39,6 @@ export const createBatchLabExperiment = (input:C.BatchLabCreateExperimentRequest
 export const getBatchLabExperiment = (experimentId:string,signal?:AbortSignal) => rpc<C.BatchLabExperimentDetail>('getBatchLabExperiment',{experimentId},signal);
 export const getBatchLabExperimentResults = (experimentId:string,input:{cursor?:string|null;limit?:number}={},signal?:AbortSignal) => rpc<C.BatchLabExperimentResultDetail>('getBatchLabExperimentResults',{experimentId,input},signal);
 export const copyBatchLabExperiment = (input:C.BatchLabCopyExperimentRequest,signal?:AbortSignal) => rpc<C.BatchLabExperimentSummary>('copyBatchLabExperiment',input,signal);
-export const createBatchLabReuseDisplayExperiment = (input:C.BatchLabReuseDisplayExperimentRequest,signal?:AbortSignal) => rpc<C.BatchLabExperimentSummary>('createBatchLabReuseDisplayExperiment',input,signal);
 export const upsertBatchLabAnnotation = (input:C.BatchLabUpsertAnnotationRequest,signal?:AbortSignal) => rpc<C.BatchLabAnnotation>('upsertBatchLabAnnotation',input,signal);
 export const startBatchLabExperiment = (input:C.BatchLabStartExperimentRequest,signal?:AbortSignal) => rpc<C.BatchLabExperimentSummary>('startBatchLabExperiment',input,signal);
 export const stopBatchLabExperiment = (input:C.BatchLabStopExperimentRequest,signal?:AbortSignal) => rpc<C.BatchLabExperimentSummary>('stopBatchLabExperiment',input,signal);
@@ -59,8 +56,8 @@ export function bytesToBase64(bytes:Uint8Array):string {
 }
 function base64ToBytes(value:string):Uint8Array { const binary=atob(value); return Uint8Array.from(binary,c=>c.charCodeAt(0)); }
 export type BatchLabSourceCsvImportResult = {history_count:number;session_count:number;character_count:number;previewable_history_count:number;dataset:DatasetVersion};
-export async function importBatchLabSourceCsvFiles(input:{historyFile:File;sessionsFile:File;charactersFile:File;name?:string;onProgress?:(progress:number)=>void}):Promise<BatchLabSourceCsvImportResult> {
-  const files=[{kind:'history',file:input.historyFile},{kind:'sessions',file:input.sessionsFile},{kind:'characters',file:input.charactersFile}] as const;
+export async function importBatchLabSourceCsvFiles(input:{historyFile:File;charactersFile:File;name?:string;onProgress?:(progress:number)=>void}):Promise<BatchLabSourceCsvImportResult> {
+  const files=[{kind:'history',file:input.historyFile},{kind:'characters',file:input.charactersFile}] as const;
   const buffers=await Promise.all(files.map(({file})=>file.arrayBuffer()));
   const manifest=await Promise.all(files.map(async({kind,file},i)=>({kind,name:file.name,size:file.size,sha256:Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',buffers[i]))).map(b=>b.toString(16).padStart(2,'0')).join(''),chunks:Math.ceil(file.size/CHUNK_BYTES)})));
   input.onProgress?.(0);
@@ -107,7 +104,10 @@ export async function downloadBatchLabExperimentJsonl(experimentId:string,signal
   do {
     const page=await getBatchLabExperimentResults(experimentId,{cursor,limit:5},signal);
     for(let sample of page.samples) {
-      if((sample as any).preview_truncated) sample=(await listBatchLabSampleSetSamples(page.experiment.sample_set_id,{cursor:String(sample.ordinal),limit:1},signal)).items[0];
+      if((sample as any).preview_truncated) {
+        sample=(await listBatchLabSampleSetSamples(page.experiment.sample_set_id,{cursor:String(sample.ordinal),limit:1},signal)).items[0];
+        if(page.experiment.exclude_last_turn) sample=excludeLastTurn(sample);
+      }
       const attempts=await Promise.all(page.attempts.filter(a=>a.sample_ordinal===sample.ordinal).map(async(attempt)=>{
         if(!(attempt as any).preview_truncated)return attempt;
         const [raw,display]=await Promise.all([getBatchLabAttemptContent(attempt.attempt_id,'raw_output',signal),getBatchLabAttemptContent(attempt.attempt_id,'display_result',signal)]);
@@ -120,10 +120,15 @@ export async function downloadBatchLabExperimentJsonl(experimentId:string,signal
   return new Blob([lines.join('\n')+'\n'],{type:'application/x-ndjson'});
 }
 function flatten(row:any):Record<string,string> {return Object.fromEntries(Object.entries(row).map(([k,v])=>[k,v==null?'':typeof v==='object'?JSON.stringify(v):String(v)]));}
+export function tableRowsToCsv(rows: Record<string, unknown>[]): string {
+  const data=rows.map(flatten);
+  const fields=[...new Set(data.flatMap(row=>Object.keys(row)))];
+  return Papa.unparse({fields,data});
+}
 export async function exportBatchLabCsvBundle():Promise<void> {
-  for(const kind of ['datasets','sample_set','snapshots','processor','experiment','attempts','events','annotations']) {
+  for(const kind of ['datasets','sample_set','snapshots','experiment','attempts','events','annotations']) {
     const rows:any[]=[];let cursor:number|null=0;
     do { const page:{items:any[];next_cursor:number|null}=await rpc('exportTable',{kind,cursor});rows.push(...page.items);cursor=page.next_cursor; } while(cursor!==null);
-    download(new Blob([Papa.unparse(rows.map(flatten))],{type:'text/csv;charset=utf-8'}),`${kind}.csv`);
+    download(new Blob([tableRowsToCsv(rows)],{type:'text/csv;charset=utf-8'}),`${kind}.csv`);
   }
 }

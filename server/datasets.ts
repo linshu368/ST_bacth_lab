@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { query } from './db.js';
 
 export const SOURCE_KINDS = ['history', 'sessions', 'characters'] as const;
+export const REQUIRED_SOURCE_KINDS = ['history', 'characters'] as const;
 export const CHUNK_BYTES = 512 * 1024;
 const kindSchema = z.enum(SOURCE_KINDS);
 const fileSchema = z.object({
@@ -36,7 +37,7 @@ export const datasetProvenanceSchema = z.object({
   characters_scope: z.enum(['all_rows', 'enabled_rows', 'referenced_rows']).optional(),
   characters_snapshot_cutoff_utc: utcTime.optional(),
   exported_at: utcTime,
-  row_counts: z.object({ history: z.number().int().nonnegative().safe(), sessions: z.number().int().nonnegative().safe(), characters: z.number().int().nonnegative().safe() }).strict(),
+  row_counts: z.object({ history: z.number().int().nonnegative().safe(), sessions: z.number().int().nonnegative().safe().optional(), characters: z.number().int().nonnegative().safe() }).strict(),
 }).strict().superRefine((value, context) => {
   if (Date.parse(value.start_utc) !== Date.parse(value.start_beijing) || Date.parse(value.end_utc_exclusive) !== Date.parse(value.end_beijing_exclusive)) {
     context.addIssue({ code: z.ZodIssueCode.custom, message: 'UTC 与北京时间范围不一致' });
@@ -65,6 +66,14 @@ export async function requireDataset(id: string, ready = true): Promise<any> {
   return row;
 }
 
+/** New imports need history and characters; old session CSVs remain valid originals. */
+export function validateSourceKinds(files: Array<{ kind: typeof SOURCE_KINDS[number] }>): void {
+  const kinds = new Set(files.map(file => file.kind));
+  if (files.length < 2 || files.length > 3 || kinds.size !== files.length || REQUIRED_SOURCE_KINDS.some(kind => !kinds.has(kind))) {
+    throw new Error('请提供聊天记录、角色两个不同的 CSV；旧会话 CSV 可选');
+  }
+}
+
 export function parseSourceCsv(content: string, kind: typeof SOURCE_KINDS[number]): SourceRow[] {
   const parsed = Papa.parse<SourceRow>(content, { header: true, skipEmptyLines: 'greedy' });
   const errors = parsed.errors.filter(error => error.code !== 'UndetectableDelimiter');
@@ -72,7 +81,7 @@ export function parseSourceCsv(content: string, kind: typeof SOURCE_KINDS[number
   if (Object.keys(parsed.meta.renamedHeaders ?? {}).length) throw new Error(`${kind} CSV 存在重复表头`);
   const fields = parsed.meta.fields ?? [];
   const required = kind === 'history'
-    ? [['id'], ['session_id', 'source_session_id'], ['character_id', 'source_character_id'], ['user_input'], ['model', 'original_model']]
+    ? [['id'], ['character_id', 'source_character_id'], ['user_input'], ['model', 'original_model']]
     : [['id']];
   for (const options of required) {
     if (!options.some(field => fields.includes(field))) throw new Error(`${kind} CSV 缺少 ${options.join(' / ')} 列`);
@@ -91,8 +100,8 @@ export async function datasetOperation(op: string, input: any): Promise<unknown>
     return (await query("SELECT * FROM lab_datasets WHERE status='ready' ORDER BY version DESC")).map(view);
   }
   if (op === 'beginDatasetImport') {
-    const value = z.object({ name: z.string().trim().min(1).max(120), idempotency_key: z.string().uuid(), files: z.array(fileSchema).length(3), provenance: datasetProvenanceSchema.optional() }).parse(input);
-    if (new Set(value.files.map(f => f.kind)).size !== 3) throw new Error('请提供聊天、会话、角色三个 CSV');
+    const value = z.object({ name: z.string().trim().min(1).max(120), idempotency_key: z.string().uuid(), files: z.array(fileSchema).min(2).max(3), provenance: datasetProvenanceSchema.optional() }).parse(input);
+    validateSourceKinds(value.files);
     for (const file of value.files) {
       if (file.chunks !== Math.ceil(file.size / CHUNK_BYTES)) throw new Error('CSV 分片数量与文件大小不匹配');
     }
@@ -128,6 +137,7 @@ export async function datasetOperation(op: string, input: any): Promise<unknown>
   if (op === 'finishDatasetImport') {
     const dataset = await requireDataset(input.datasetId, false);
     if (dataset.status === 'ready') return { ...dataset.counts, dataset: view(dataset) };
+    validateSourceKinds(dataset.manifest);
     const tables: Record<string, SourceRow[]> = {};
     for (const file of dataset.manifest as SourceFile[]) {
       // Read bounded pages; large originals can exceed an HTTP database response.
@@ -141,7 +151,7 @@ export async function datasetOperation(op: string, input: any): Promise<unknown>
       if (bytes.length !== file.size || createHash('sha256').update(bytes).digest('hex') !== file.sha256) throw new Error(`${file.name} 校验失败，请重新导入`);
       tables[file.kind] = parseSourceCsv(bytes.toString('utf8'), file.kind);
     }
-    for (const kind of SOURCE_KINDS) {
+    for (const { kind } of dataset.manifest as SourceFile[]) {
       let batch: any[] = [], size = 0;
       const flush = async () => {
         if (!batch.length) return;
@@ -158,10 +168,9 @@ export async function datasetOperation(op: string, input: any): Promise<unknown>
       }
       await flush();
     }
-    const validSessions = new Set(tables.sessions.filter(r=>!r.deleted_at).map(r=>r.id));
     const characters = new Set(tables.characters.map(r=>r.id));
-    const counts = { history_count: tables.history.length, session_count: tables.sessions.length, character_count: tables.characters.length,
-      previewable_history_count: tables.history.filter(r => r.user_input && (r.model || r.original_model) && validSessions.has(r.session_id || r.source_session_id) && characters.has(r.character_id || r.source_character_id)).length };
+    const counts = { history_count: tables.history.length, session_count: tables.sessions?.length ?? 0, character_count: tables.characters.length,
+      previewable_history_count: tables.history.filter(r => r.user_input && (r.model || r.original_model) && characters.has(r.character_id || r.source_character_id)).length };
     const [ready] = await query("UPDATE lab_datasets SET status='ready',counts=$2::jsonb,ready_at=coalesce(ready_at,now()) WHERE id=$1 RETURNING *", [dataset.id,JSON.stringify(counts)]);
     return { ...counts, dataset: view(ready) };
   }

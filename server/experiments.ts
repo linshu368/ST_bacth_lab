@@ -3,7 +3,6 @@ import { z } from 'zod';
 import {
   batchLabCreateExperimentRequestSchema,
   batchLabCopyExperimentRequestSchema,
-  batchLabReuseDisplayExperimentRequestSchema,
   batchLabStartExperimentRequestSchema,
   batchLabStopExperimentRequestSchema,
   batchLabDeleteExperimentRequestSchema,
@@ -15,7 +14,10 @@ import {
   type BatchLabOutputPreset,
 } from '../src/lib/batch-lab-contracts.js';
 import { query, transaction } from './db.js';
-import { digest, operationId, runPostprocessor, renderSafeHtml, serviceError } from './processors.js';
+import { digest, operationId, serviceError } from './processors.js';
+import { pureUserInput, withInstructionPrompt } from '../src/lib/instruction-prompt.js';
+import { excludeLastTurn } from '../src/lib/replay-sample.js';
+import { COMPARISON_SUMMARY_SQL, comparisonSummary } from './comparison-summary.js';
 
 type Row = Record<string, any>;
 type Message = { role: 'system' | 'user' | 'assistant'; content: string };
@@ -26,9 +28,26 @@ export type ExperimentDependencies = {
   env?: Record<string, string | undefined>;
 };
 const uuid = z.string().uuid();
-const MAX_BATCH = 4;
+const DEFAULT_CONCURRENCY = 4;
 const PAGE_SIZE = 5;
 const RESULT_BYTE_BUDGET = 3 * 1024 * 1024;
+
+// Startup needs only the replay tail, not complete prompts, character cards or metadata.
+export const START_SAMPLE_SQL = `SELECT s.ordinal,jsonb_build_object(
+  'history',tail.history,'history_offset',tail.history_offset,'turn_models',s.data->'turn_models','user_input',s.data->'user_input',
+  'original_model',s.data->'original_model','turn_index',s.data->'turn_index',
+  'original_assistant_reply',CASE WHEN $3::boolean THEN s.data->'original_assistant_reply' ELSE 'null'::jsonb END
+) AS data FROM lab_snapshots s
+CROSS JOIN LATERAL (
+  WITH messages AS MATERIALIZED (
+    SELECT value,ordinality FROM jsonb_array_elements(COALESCE(s.data->'history','[]'::jsonb)) WITH ORDINALITY
+  ), boundary AS (
+    SELECT COALESCE((SELECT ordinality FROM messages WHERE value->>'role'='user'
+      ORDER BY ordinality DESC OFFSET $2::int LIMIT 1),1) AS first
+  ) SELECT COALESCE(jsonb_agg(CASE WHEN $3::boolean OR value->>'role'='user' THEN value
+      ELSE jsonb_build_object('role',value->>'role','content','') END ORDER BY ordinality),'[]'::jsonb) AS history,COALESCE(min(ordinality)-1,0) AS history_offset
+    FROM messages,boundary WHERE ordinality>=boundary.first
+) tail WHERE s.sample_set_id=$1::uuid AND ($4::int[] IS NULL OR s.ordinal=ANY($4::int[])) ORDER BY s.ordinal`;
 
 function byteLength(value: unknown): number { return Buffer.byteLength(JSON.stringify(value), 'utf8'); }
 function truncateUtf8(text: string, maxBytes: number): string {
@@ -54,14 +73,8 @@ function visibleAttempt(row: Row): Row {
     const result = truncateUtf8(text, 16 * 1024); truncated ||= result !== text; return result;
   };
   if (typeof data.raw_output === 'string') data.raw_output = shorten(data.raw_output);
-  if (data.display_result) {
-    const display = { ...data.display_result };
-    display.input_text = shorten(display.input_text ?? '');
-    display.output_text = shorten(display.output_text ?? '');
-    if (byteLength(display.sanitized_html ?? '') > 100 * 1024 || truncated) display.sanitized_html = renderSafeHtml(display.output_text);
-    data.display_result = display;
-  }
-  return { ...data, attempt_id: row.id, display_result: data.display_result ?? null, preview_truncated: truncated };
+  if (typeof data.replay_user_input === 'string') data.replay_user_input = shorten(pureUserInput(data.replay_user_input));
+  return { ...data, attempt_id: row.id, display_result: null, preview_truncated: truncated };
 }
 
 function visibleSample(sample: Row): Row {
@@ -144,14 +157,45 @@ WITH expired AS (
 )
 SELECT DISTINCT experiment_id FROM expired`;
 
-export function buildAttemptMessages(history: Message[], previous: string[], input: string, preset?: Partial<BatchLabOutputPreset> | null): Message[] {
-  const instructions = [preset?.content?.trim() ? `内容要求：${preset.content.trim()}` : '', preset?.format?.trim() ? `格式要求：${preset.format.trim()}` : ''].filter(Boolean);
-  return [
-    ...(instructions.length ? [{ role: 'system' as const, content: `请严格遵循本次 Batch Lab 输出预设。\n${instructions.join('\n')}` }] : []),
-    ...history.map(message => ({ role: message.role, content: message.content })),
-    ...previous.map(content => ({ role: 'assistant' as const, content })),
-    { role: 'user', content: input },
+function replayTranscript(history: Message[], input: string, turns: number) {
+  input = pureUserInput(input);
+  const messages = history.map(message => ({ role: message.role, content: message.role === 'user' ? pureUserInput(message.content) : message.content }));
+  const last = messages.at(-1);
+  // Imported histories already include the current input, sometimes wrapped in roleplay instructions.
+  const includesInput = last?.role === 'user' && last.content.trim() === input.trim();
+  if (includesInput) last.content = input;
+  if (!includesInput) messages.push({ role: 'user', content: input });
+  const users = messages.flatMap((message, index) => message.role === 'user' ? [index] : []);
+  if (users.length < turns) throw serviceError('BATCH_LAB_EXPERIMENT_VALIDATION_ERROR', `样本只有 ${users.length} 轮用户输入，无法重跑最后 ${turns} 轮`);
+  return { messages, users: users.slice(-turns) };
+}
+
+export function buildAttemptMessages(history: Message[], previous: string[], input: string, preset?: Partial<BatchLabOutputPreset> | null, turns = 1): Message[] {
+  const replay = replayTranscript(history, input, turns);
+  if (previous.length >= turns) throw serviceError('BATCH_LAB_EXPERIMENT_VALIDATION_ERROR', '重跑轮次超出范围');
+  const messages: Message[] = [
+    ...replay.messages.slice(0, replay.users[0]),
   ];
+  for (let turn = 0; turn <= previous.length; turn++) {
+    messages.push({ role: 'user', content: withInstructionPrompt(replay.messages[replay.users[turn]].content, preset?.content) });
+    if (turn < previous.length) {
+      messages.push({ role: 'assistant', content: previous[turn] });
+      messages.push(...replay.messages.slice(replay.users[turn] + 1, replay.users[turn + 1]).filter(message => message.role === 'system'));
+    }
+  }
+  return messages;
+}
+
+function originalAttempt(sample: Row, turns: number, turn: number): Row {
+  const replay = replayTranscript(sample.history ?? [], sample.user_input, turns);
+  const index = replay.users[turn - 1];
+  const reply = turn === turns ? sample.original_assistant_reply
+    : replay.messages.slice(index + 1, replay.users[turn]).filter(message => message.role === 'assistant').map(message => message.content).join('\n\n');
+  if (typeof reply !== 'string' || !reply.trim()) throw serviceError('BATCH_LAB_EXPERIMENT_VALIDATION_ERROR', `样本 #${sample.ordinal} 的重跑第 ${turn} 轮缺少原始线上回复`);
+  const model = sample.turn_models?.find((model: Row) => model.user_message_index === index);
+  return { raw_output: reply, source_model_verified: Boolean(model), source_turn_index: model?.turn_index, source_history_id: model?.source_history_id, replay_user_input: replay.messages[index].content,
+    finish_reason: 'original_reused',
+    output_source: 'original', request_model: model?.model ?? sample.original_model ?? null };
 }
 
 function detail(experiment: Row): Row {
@@ -225,6 +269,20 @@ export function createExperimentService(dependencies: ExperimentDependencies) {
 
   async function create(input: any, operation = 'createBatchLabExperiment', lineage: Row = {}): Promise<Row> {
     const parsed = batchLabCreateExperimentRequestSchema.strip().parse(input);
+    parsed.variants = parsed.variants.map(variant => ({ ...variant, processor_version_id: null,
+      max_turns: parsed.run_mode === 'multi_turn' ? variant.max_turns : 1 }));
+    if (parsed.comparison_variable === 'model' && !parsed.output_preset?.content?.trim()) {
+      throw serviceError('BATCH_LAB_EXPERIMENT_VALIDATION_ERROR', '模型对比需要手动填写两组共用的 Instruction prompt');
+    }
+    if (parsed.comparison_variable) {
+      const sharedProvider = parsed.variants.find(variant => variant.provider_config)?.provider_config;
+      parsed.variants = parsed.variants.map(variant => ({ ...variant, sampling: {},
+        provider_config: sharedProvider ? { ...sharedProvider, module_name: variant.openrouter_model_id } : undefined,
+        ...(parsed.comparison_variable === 'model'
+          ? { generation_mode: 'generate' as const, output_preset: parsed.output_preset }
+          : { model_source: 'sample' as const }),
+      }));
+    }
     const requestDigest = digest({ ...parsed, ...lineage });
     const id = operationId(operation, parsed.idempotency_key);
     const existing = await q(`SELECT data FROM lab_records WHERE kind='experiment' AND id=$1::uuid`, [id]);
@@ -234,18 +292,24 @@ export function createExperimentService(dependencies: ExperimentDependencies) {
     }
     const sampleSet = await record('sample_set', parsed.sample_set_id);
     if (sampleSet.deleted_at) throw serviceError('BATCH_LAB_SAMPLE_SET_NOT_FOUND', '样本集已归档', 409);
-    for (const variant of parsed.variants) {
-      if (variant.processor_version_id) {
-        const processors = await q(`SELECT id FROM lab_records WHERE kind='processor' AND id=$1::uuid`, [variant.processor_version_id]);
-        if (!processors[0]) throw serviceError('BATCH_LAB_PROCESSOR_NOT_FOUND', '后处理版本不存在', 404);
-      }
+    let selectedSampleOrdinals: number[] | undefined;
+    if (parsed.sample_limit !== undefined) {
+      const selected = await q(`SELECT ordinal FROM lab_snapshots WHERE sample_set_id=$1::uuid ORDER BY random() LIMIT $2`,
+        [parsed.sample_set_id, parsed.sample_limit]);
+      selectedSampleOrdinals = selected.map(row => Number(row.ordinal));
+      if (!selectedSampleOrdinals.length) throw serviceError('BATCH_LAB_EXPERIMENT_VALIDATION_ERROR', '样本集没有可运行的样本');
     }
     const data: Row = { id, name: parsed.name, sample_set_id: parsed.sample_set_id,
       source_environment: sampleSet.source_environment ?? 'test', status: 'draft', purpose: parsed.purpose ?? null,
+      concurrency: parsed.concurrency ?? DEFAULT_CONCURRENCY,
+      sample_limit: parsed.sample_limit, selected_sample_ordinals: selectedSampleOrdinals,
+      comparison_variable: parsed.comparison_variable,
       run_mode: parsed.run_mode ?? 'single', output_preset: parsed.output_preset, provider_config: parsed.provider_config,
+      exclude_last_turn: parsed.exclude_last_turn ?? true,
       variants: parsed.variants, total_attempts: 0, completed_attempts: 0, failed_attempts: 0,
       created_at: new Date().toISOString(), started_at: null, completed_at: null,
-      dataset_version_id: sampleSet.dataset_version_id ?? undefined, sample_set_version: sampleSet.version ?? undefined,
+      dataset_version_id: sampleSet.dataset_version_id ?? undefined, source_versions: sampleSet.source_versions,
+      sample_set_version: sampleSet.version ?? undefined,
       ...lineage, request_digest: requestDigest };
     const rows = await q(`INSERT INTO lab_records(kind,id,data)
       SELECT 'experiment',$1::uuid,$2::jsonb FROM lab_records s
@@ -259,33 +323,63 @@ export function createExperimentService(dependencies: ExperimentDependencies) {
   async function start(input: any): Promise<Row> {
     const parsed = batchLabStartExperimentRequestSchema.strip().parse(input);
     const experiment = await record('experiment', parsed.experiment_id);
+    if (experiment.kind === 'reuse_display') throw serviceError('BATCH_LAB_DISABLED', '富文本后处理复用暂未开放');
     if (experiment.deleted_at) throw serviceError('BATCH_LAB_EXPERIMENT_STATE_CONFLICT', '已归档实验不能执行', 409);
-    if (!['draft', 'queued', 'running'].includes(experiment.status)) return experiment;
+    if (experiment.status !== 'draft') return experiment;
+    const fixed: Row[] = [];
+    const originals = experiment.variants.filter((variant: Row) => variant.generation_mode === 'original');
+    if (originals.length || (experiment.status === 'draft' && (experiment.run_mode === 'multi_turn' || experiment.exclude_last_turn || experiment.comparison_variable))) {
+      const turns = experiment.run_mode === 'multi_turn' ? Math.max(...experiment.variants.map((variant: Row) => variant.max_turns)) : 1;
+      const samples = await q(START_SAMPLE_SQL, [experiment.sample_set_id, turns + (experiment.exclude_last_turn ? 1 : 0), originals.length > 0, experiment.selected_sample_ordinals ?? null]);
+      for (const sample of samples) {
+        if (sample.data.turn_models) {
+          const offset = Number(sample.data.history_offset ?? 0);
+          sample.data.turn_models = sample.data.turn_models.filter((model: Row) => model.user_message_index >= offset)
+            .map((model: Row) => ({ ...model, user_message_index: model.user_message_index - offset,
+              assistant_message_indices: model.assistant_message_indices.filter((index: number) => index >= offset).map((index: number) => index - offset) }));
+        }
+        if (experiment.variants.some((variant: Row) => variant.model_source === 'sample') && (!sample.data.original_model || sample.data.original_model === 'unknown')) {
+          throw serviceError('BATCH_LAB_EXPERIMENT_VALIDATION_ERROR', `样本 #${sample.ordinal} 缺少原始模型名称`);
+        }
+        if (experiment.exclude_last_turn) sample.data = excludeLastTurn(sample.data);
+        try { replayTranscript(sample.data.history ?? [], sample.data.user_input, turns); }
+        catch (error: any) { throw serviceError('BATCH_LAB_EXPERIMENT_VALIDATION_ERROR', `样本 #${sample.ordinal}：${error.message}`); }
+        for (const variant of originals) {
+          const count = experiment.run_mode === 'multi_turn' ? variant.max_turns : 1;
+          for (let turn = 1; turn <= count; turn++) fixed.push({ sample_ordinal: sample.ordinal, variant_key: variant.key, turn_index: turn,
+            payload: originalAttempt({ ...sample.data, ordinal: sample.ordinal }, count, turn) });
+        }
+      }
+    }
     await q(`WITH experiment AS MATERIALIZED (
       SELECT id,data FROM lab_records WHERE kind='experiment' AND id=$1::uuid
         AND data->>'status' IN ('draft','queued','running') AND NULLIF(data->>'deleted_at','') IS NULL FOR UPDATE
     ), planned AS MATERIALIZED (
       SELECT gen_random_uuid() AS id,e.id AS experiment_id,s.sample_set_id,s.ordinal AS sample_ordinal,
-        v.value->>'key' AS variant_key,t.turn_index
+        v.value->>'key' AS variant_key,t.turn_index,f.payload
       FROM experiment e JOIN lab_snapshots s ON s.sample_set_id=(e.data->>'sample_set_id')::uuid
       CROSS JOIN LATERAL jsonb_array_elements(e.data->'variants') v
-      CROSS JOIN LATERAL generate_series(1,LEAST(5,(v.value->>'max_turns')::int)) t(turn_index)
+      CROSS JOIN LATERAL generate_series(1,CASE WHEN e.data->>'run_mode'='multi_turn' THEN LEAST(5,(v.value->>'max_turns')::int) ELSE 1 END) t(turn_index)
+      LEFT JOIN jsonb_to_recordset($3::jsonb) AS f(sample_ordinal int,variant_key text,turn_index int,payload jsonb)
+        ON f.sample_ordinal=s.ordinal AND f.variant_key=v.value->>'key' AND f.turn_index=t.turn_index
+      WHERE $4::int[] IS NULL OR s.ordinal=ANY($4::int[])
     ), inserted AS (
       INSERT INTO lab_attempts(id,experiment_id,sample_set_id,sample_ordinal,variant_key,turn_index,status,attempt_count,data)
-      SELECT id,experiment_id,sample_set_id,sample_ordinal,variant_key,turn_index,'pending',0,
+      SELECT id,experiment_id,sample_set_id,sample_ordinal,variant_key,turn_index,CASE WHEN payload IS NULL THEN 'pending' ELSE 'succeeded' END,0,
         jsonb_build_object('id',id,'experiment_id',experiment_id,'sample_set_id',sample_set_id,
           'sample_ordinal',sample_ordinal,'variant_key',variant_key,'turn_index',turn_index,'status','pending',
           'attempt_count',0,'generation_id',NULL,'finish_reason',NULL,'raw_output',NULL,'display_result_id',NULL,
           'display_result',NULL,'error_code',NULL,'error_message',NULL,'started_at',NULL,'completed_at',NULL,'created_at',now())
+          || CASE WHEN payload IS NULL THEN '{}'::jsonb ELSE payload || jsonb_build_object('status','succeeded','completed_at',now()) END
       FROM planned ON CONFLICT(experiment_id,sample_ordinal,variant_key,turn_index) DO NOTHING RETURNING *
     ), events AS (
       INSERT INTO lab_attempt_events(attempt_id,experiment_id,event_type,data)
-      SELECT id,experiment_id,'created',jsonb_build_object('sample_ordinal',sample_ordinal,'variant_key',variant_key,'turn_index',turn_index) FROM inserted RETURNING id
+      SELECT id,experiment_id,CASE WHEN status='succeeded' THEN 'original_reused' ELSE 'created' END,jsonb_build_object('sample_ordinal',sample_ordinal,'variant_key',variant_key,'turn_index',turn_index) FROM inserted RETURNING id
     ) UPDATE lab_records e SET data=e.data || jsonb_build_object('status','queued',
       'started_at',COALESCE(NULLIF(e.data->'started_at','null'::jsonb),to_jsonb(now())),
       'start_idempotency_key',$2::text)
       WHERE e.kind='experiment' AND e.id IN (SELECT id FROM experiment) AND e.data->>'status'='draft'`,
-    [parsed.experiment_id, parsed.idempotency_key]);
+    [parsed.experiment_id, parsed.idempotency_key, JSON.stringify(fixed), experiment.selected_sample_ordinals ?? null]);
     await refresh(parsed.experiment_id);
     return record('experiment', parsed.experiment_id);
   }
@@ -380,36 +474,36 @@ export function createExperimentService(dependencies: ExperimentDependencies) {
     let output: Row = {};
     try {
       const experiment = await record('experiment', attempt.experiment_id);
-      const variant = experiment.variants.find((item: Row) => item.key === attempt.variant_key) as BatchLabExperimentVariant | undefined;
+      let variant = experiment.variants.find((item: Row) => item.key === attempt.variant_key) as BatchLabExperimentVariant | undefined;
       const snapshots = await q(`SELECT data FROM lab_snapshots WHERE sample_set_id=$1::uuid AND ordinal=$2`, [attempt.sample_set_id, attempt.sample_ordinal]);
-      const sample = snapshots[0]?.data;
+      const storedSample = snapshots[0]?.data;
+      const sample = storedSample && experiment.exclude_last_turn ? excludeLastTurn(storedSample) : storedSample;
       if (!variant || !sample) throw serviceError('BATCH_LAB_EXPERIMENT_VALIDATION_ERROR', '实验快照或变体不存在');
-      if (experiment.kind === 'reuse_display') {
-        const sourceId = experiment.generation_source_experiment_id || experiment.source_experiment_id;
-        const source = await q(`SELECT id,data FROM lab_attempts WHERE experiment_id=$1::uuid AND sample_ordinal=$2 AND variant_key=$3 AND turn_index=$4 AND status='succeeded'`,
-          [sourceId, attempt.sample_ordinal, attempt.variant_key, attempt.turn_index]);
-        if (!source[0] || typeof source[0].data.raw_output !== 'string') throw serviceError('BATCH_LAB_EXPERIMENT_VALIDATION_ERROR', '源实验对应轮次没有可复用的成功输出');
-        output = { raw_output: source[0].data.raw_output, generation_id: source[0].data.generation_id ?? null,
-          finish_reason: source[0].data.finish_reason ?? null, reused_from_attempt_id: source[0].id,
-          input_messages: source[0].data.input_messages ?? [], request_model: source[0].data.request_model ?? null };
-        if (!(await requestLog(attempt, { ...output, reuse_only: true }))) return false;
-      } else {
-        const previous = await q(`SELECT data->>'raw_output' AS output FROM lab_attempts
-          WHERE experiment_id=$1::uuid AND sample_ordinal=$2 AND variant_key=$3 AND turn_index<$4 AND status='succeeded' ORDER BY turn_index`,
-        [attempt.experiment_id, attempt.sample_ordinal, attempt.variant_key, attempt.turn_index]);
-        const messages = buildAttemptMessages(sample.history ?? [], previous.map(row => row.output), sample.user_input, variant.output_preset ?? experiment.output_preset);
-        const log = { input_messages: messages, request_model: variant.provider_config?.module_name || experiment.provider_config?.module_name || variant.openrouter_model_id,
-          request_sampling: variant.sampling, request_base_url: variant.provider_config?.base_url || experiment.provider_config?.base_url || env.BATCH_LAB_MODEL_BASE_URL || 'https://openrouter.ai/api/v1/chat/completions' };
-        if (!(await requestLog(attempt, log))) return false;
-        output = { ...log, ...await modelRequest(variant, experiment, messages) };
+      if (variant.model_source === 'sample') {
+        const replay = replayTranscript(sample.history ?? [], sample.user_input, experiment.run_mode === 'multi_turn' ? variant.max_turns : 1);
+        const turnModel = sample.turn_models?.find((model: Row) => model.user_message_index === replay.users[attempt.turn_index - 1]);
+        const model = sample.turn_models ? turnModel?.model : storedSample.original_model;
+        if (!model || model === 'unknown') throw serviceError('BATCH_LAB_EXPERIMENT_VALIDATION_ERROR', '样本缺少原始模型名称');
+        variant = { ...variant, model_id: model, openrouter_model_id: model,
+          provider_config: variant.provider_config ? { ...variant.provider_config, module_name: model } : undefined };
       }
-      let displayResult: any = null;
-      if (variant.processor_version_id) {
-        const processors = await q(`SELECT data FROM lab_records WHERE kind='processor' AND id=$1::uuid`, [variant.processor_version_id]);
-        if (!processors[0]) throw serviceError('BATCH_LAB_PROCESSOR_NOT_FOUND', '后处理版本不存在');
-        displayResult = await runPostprocessor(processors[0].data, output.raw_output);
+      if (experiment.kind === 'reuse_display') throw serviceError('BATCH_LAB_DISABLED', '富文本后处理复用暂未开放');
+      if (variant.generation_mode === 'original') {
+        return finish(attempt, 'succeeded', { ...originalAttempt(sample, experiment.run_mode === 'multi_turn' ? variant.max_turns : 1, attempt.turn_index), display_result: null, display_result_id: null });
       }
-      output = { ...output, display_result: displayResult, display_result_id: displayResult?.id ?? null, error_code: null, error_message: null };
+      const previous = await q(`SELECT data->>'raw_output' AS output FROM lab_attempts
+        WHERE experiment_id=$1::uuid AND sample_ordinal=$2 AND variant_key=$3 AND turn_index<$4 AND status='succeeded' ORDER BY turn_index`,
+      [attempt.experiment_id, attempt.sample_ordinal, attempt.variant_key, attempt.turn_index]);
+      const turns = experiment.run_mode === 'multi_turn' ? variant.max_turns : 1;
+      if (previous.length !== attempt.turn_index - 1) throw serviceError('BATCH_LAB_EXPERIMENT_VALIDATION_ERROR', '前序轮次尚未完成');
+      const preset = experiment.comparison_variable === 'model' ? experiment.output_preset : variant.output_preset ?? experiment.output_preset;
+      const messages = buildAttemptMessages(sample.history ?? [], previous.map(row => row.output), sample.user_input, preset, turns);
+      const replay = replayTranscript(sample.history ?? [], sample.user_input, turns);
+      const log = { input_messages: messages, replay_user_input: replay.messages[replay.users[attempt.turn_index - 1]].content, request_model: variant.provider_config?.module_name || experiment.provider_config?.module_name || variant.openrouter_model_id,
+        request_sampling: variant.sampling, request_base_url: variant.provider_config?.base_url || experiment.provider_config?.base_url || env.BATCH_LAB_MODEL_BASE_URL || 'https://openrouter.ai/api/v1/chat/completions' };
+      if (!(await requestLog(attempt, log))) return false;
+      output = { ...log, ...await modelRequest(variant, experiment, messages) };
+      output = { ...output, display_result: null, display_result_id: null, error_code: null, error_message: null };
     } catch (error: any) {
       const uncertain = error?.code === 'MODEL_REQUEST_TIMEOUT' || error?.name === 'TypeError';
       await finish(attempt, uncertain ? 'unknown' : 'failed', { ...output, error_code: error?.code ?? 'EXECUTION_FAILED', error_message: String(error?.message ?? '执行失败').slice(0, 2000) });
@@ -424,7 +518,8 @@ export function createExperimentService(dependencies: ExperimentDependencies) {
     const parsed = scoped ? batchLabRunExperimentWorkerRequestSchema.strip().parse(input) : batchLabRunWorkerRequestSchema.strip().parse(input);
     const id = 'experiment_id' in parsed ? String(parsed.experiment_id) : null;
     await expire(id);
-    const attempts = await q(CLAIM_SQL, [id, parsed.worker_id, Math.min(MAX_BATCH, parsed.claim_limit)]);
+    const concurrency = id ? (await record('experiment', id)).concurrency ?? DEFAULT_CONCURRENCY : DEFAULT_CONCURRENCY;
+    const attempts = await q(CLAIM_SQL, [id, parsed.worker_id, Math.min(concurrency, parsed.claim_limit)]);
     const settled = await Promise.allSettled(attempts.map(runAttempt));
     const rejected = settled.find(result => result.status === 'rejected');
     if (rejected?.status === 'rejected') throw rejected.reason;
@@ -440,22 +535,32 @@ export function createExperimentService(dependencies: ExperimentDependencies) {
     const paging = input.input ?? {};
     const offset = z.coerce.number().int().min(0).parse(paging.cursor ?? 0);
     const limit = all ? 500 : Math.min(PAGE_SIZE, z.coerce.number().int().min(1).max(500).parse(paging.limit ?? PAGE_SIZE));
-    const snapshots = await q(`SELECT ordinal,data FROM lab_snapshots WHERE sample_set_id=$1::uuid ORDER BY ordinal LIMIT $2 OFFSET $3`, [sampleSet.id, limit + 1, offset]);
-    const samples = snapshots.slice(0, limit).map(row => ({ ...row.data, ordinal: row.ordinal }));
+    const snapshots = await q(`SELECT ordinal,data FROM lab_snapshots WHERE sample_set_id=$1::uuid
+      AND ($4::int[] IS NULL OR ordinal=ANY($4::int[])) ORDER BY ordinal LIMIT $2 OFFSET $3`,
+      [sampleSet.id, limit + 1, offset, experiment.selected_sample_ordinals ?? null]);
+    const samples = snapshots.slice(0, limit).map(row => ({ ...(experiment.exclude_last_turn ? excludeLastTurn(row.data) : row.data), ordinal: row.ordinal }));
     const ordinals = samples.map(sample => sample.ordinal);
     const attemptProjection = all ? '*' : `id,experiment_id,sample_set_id,sample_ordinal,variant_key,turn_index,status,
       lease_owner,lease_expires_at,attempt_count,data - 'input_messages' - 'request_sampling' - 'response_metadata' AS data`;
-    const [attempts, annotations, counts] = await Promise.all([
+    const [attempts, annotations, counts, summaryRows] = await Promise.all([
       q(`SELECT ${attemptProjection} FROM lab_attempts WHERE experiment_id=$1::uuid AND sample_ordinal=ANY($2::int[]) ORDER BY sample_ordinal,variant_key,turn_index`, [id, ordinals]),
       q(`SELECT data FROM lab_annotations WHERE experiment_id=$1::uuid AND (sample_ordinal=-1 OR sample_ordinal=ANY($2::int[])) ORDER BY sample_ordinal,turn_index`, [id, ordinals]),
       q(`SELECT status,count(*)::int AS count FROM lab_attempts WHERE experiment_id=$1::uuid GROUP BY status`, [id]),
+      q(COMPARISON_SUMMARY_SQL, [id, experiment.variants[0].key, experiment.variants[1].key, !!experiment.exclude_last_turn]),
     ]);
     const byStatus = Object.fromEntries(counts.map(row => [row.status, Number(row.count)]));
     const visibleSamples: Row[] = [];
     const visibleAttempts: Row[] = [];
     let pageBytes = byteLength({ experiment, sampleSet, annotations });
     for (const sample of samples) {
-      const selectedSample = all ? sample : visibleSample(sample);
+      const selectedSample = all ? sample : visibleSample({ ...sample,
+        history: (sample.history ?? []).map((message: Message) => ({ ...message, content: message.role === 'user' ? pureUserInput(message.content) : message.content })),
+        user_input: pureUserInput(sample.user_input ?? '') });
+      if (!all) {
+        const turns = experiment.run_mode === 'multi_turn' ? Math.max(...experiment.variants.map((variant: Row) => variant.max_turns)) : 1;
+        try { selectedSample.replay_start_index = replayTranscript(sample.history ?? [], sample.user_input, turns).users[0]; }
+        catch { selectedSample.replay_start_index = 0; }
+      }
       const selectedAttempts = attempts.filter(row => row.sample_ordinal === sample.ordinal).map(row => all
         ? { ...attemptData(row), attempt_id: row.id, display_result: row.data.display_result ?? null }
         : visibleAttempt(row));
@@ -463,7 +568,7 @@ export function createExperimentService(dependencies: ExperimentDependencies) {
       if (!all && visibleSamples.length && pageBytes + bytes > RESULT_BYTE_BUDGET) break;
       visibleSamples.push(selectedSample); visibleAttempts.push(...selectedAttempts); pageBytes += bytes;
     }
-    return { experiment: detail(experiment), sample_set: sampleSet, samples: visibleSamples,
+    return { experiment: detail(experiment), sample_set: sampleSet, samples: visibleSamples, comparison_summary: comparisonSummary(summaryRows),
       attempts: visibleAttempts,
       annotations: annotations.map(row => row.data), progress: {
         total_attempts: counts.reduce((total, row) => total + Number(row.count), 0), completed_attempts: byStatus.succeeded ?? 0,
@@ -498,24 +603,30 @@ export function createExperimentService(dependencies: ExperimentDependencies) {
         if (!rows[0]) throw serviceError('BATCH_LAB_EXPERIMENT_STATE_CONFLICT', '请先停止实验并等待已领取任务结束，再归档', 409);
         return { id: parsed.experiment_id, deleted_at: rows[0].data.deleted_at };
       }
-      case 'copyBatchLabExperiment':
-      case 'createBatchLabReuseDisplayExperiment': {
-        const reuse = op === 'createBatchLabReuseDisplayExperiment';
-        const parsed = reuse ? batchLabReuseDisplayExperimentRequestSchema.strip().parse(input) : batchLabCopyExperimentRequestSchema.strip().parse(input);
+      case 'createBatchLabReuseDisplayExperiment': throw serviceError('BATCH_LAB_DISABLED', '富文本后处理复用暂未开放');
+      case 'copyBatchLabExperiment': {
+        const parsed = batchLabCopyExperimentRequestSchema.strip().parse(input);
         const source = await record('experiment', parsed.source_experiment_id);
-        const variants = reuse ? (parsed as any).variants : source.variants;
-        if (reuse && variants.some((variant: Row) => !source.variants.some((original: Row) => original.key === variant.key && original.max_turns >= variant.max_turns))) {
-          throw serviceError('BATCH_LAB_EXPERIMENT_VALIDATION_ERROR', '复用实验的变体标识和轮数必须与源输出对应');
-        }
-        return create({ ...parsed, variants, sample_set_id: source.sample_set_id, run_mode: source.run_mode,
-          output_preset: reuse ? (parsed as any).output_preset : source.output_preset,
-          provider_config: reuse ? (parsed as any).provider_config : source.provider_config }, op,
-        { kind: reuse ? 'reuse_display' : 'generation', source_experiment_id: source.id,
-          generation_source_experiment_id: reuse ? source.generation_source_experiment_id || source.id : null });
+        const variants = source.variants;
+        return create({ ...parsed, variants, sample_set_id: source.sample_set_id, run_mode: source.run_mode, concurrency: source.concurrency, sample_limit: source.sample_limit, comparison_variable: source.comparison_variable,
+          output_preset: source.output_preset, provider_config: source.provider_config }, op,
+        { kind: 'generation', source_experiment_id: source.id, generation_source_experiment_id: null });
       }
       case 'upsertBatchLabAnnotation': {
         const parsed = batchLabUpsertAnnotationRequestSchema.strip().parse(input);
         const experiment = await record('experiment', parsed.experiment_id);
+        if (parsed.tag?.startsWith('preference:')) {
+          const winner = parsed.tag.slice('preference:'.length);
+          if (parsed.sample_ordinal === null || parsed.turn_index === null ||
+            (winner !== 'tie' && !experiment.variants.some((variant: Row) => variant.key === winner))) {
+            throw serviceError('BATCH_LAB_EXPERIMENT_VALIDATION_ERROR', '请选择有效的样本、轮次和对比组');
+          }
+          const completed = await q(`SELECT variant_key FROM lab_attempts WHERE experiment_id=$1::uuid AND sample_ordinal=$2 AND turn_index=$3 AND status='succeeded'`,
+            [experiment.id, parsed.sample_ordinal, parsed.turn_index]);
+          if (!experiment.variants.every((variant: Row) => completed.some(row => row.variant_key === variant.key))) {
+            throw serviceError('BATCH_LAB_EXPERIMENT_VALIDATION_ERROR', '本轮两组结果完成后才能评价');
+          }
+        }
         if (parsed.sample_ordinal !== null) {
           const rows = await q(`SELECT ordinal FROM lab_snapshots WHERE sample_set_id=$1::uuid AND ordinal=$2`, [experiment.sample_set_id, parsed.sample_ordinal]);
           if (!rows[0]) throw serviceError('BATCH_LAB_EXPERIMENT_VALIDATION_ERROR', '标注样本不存在');

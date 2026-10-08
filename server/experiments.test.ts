@@ -4,6 +4,8 @@ import { readFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { PGlite } from '@electric-sql/pglite';
 import { createExperimentService, CLAIM_SQL, COMPLETE_SQL, buildAttemptMessages, modelUrl } from './experiments.js';
+import { pureUserInput, withInstructionPrompt } from '../src/lib/instruction-prompt.js';
+import { excludeLastTurn } from '../src/lib/replay-sample.js';
 
 const db = new PGlite();
 const q = async <T = any>(text: string, values: any[] = []): Promise<T[]> => (await db.query<T>(text, values)).rows;
@@ -29,11 +31,15 @@ async function fixture(label: string, turns = 2, fetcher: typeof fetch = async (
   await q(`INSERT INTO lab_records(kind,id,data) VALUES ('sample_set',$1,$2)`, [setId, JSON.stringify(data)]);
   for (let ordinal = 0; ordinal < 2; ordinal++) {
     await q(`INSERT INTO lab_snapshots(sample_set_id,ordinal,data) VALUES($1,$2,$3)`, [setId, ordinal, JSON.stringify({
-      ordinal, source_history_id: randomUUID(), history: [{ role: 'system', content: `context:${label}` }], user_input: `${label}:${ordinal}`,
+      ordinal, source_history_id: randomUUID(), history: [{ role: 'system', content: `context:${label}` },
+        ...Array.from({ length: turns - 1 }, (_, index) => [
+          { role: 'user', content: `${label}:${ordinal}:earlier-${index}` },
+          { role: 'assistant', content: `old-reply-${index}` },
+        ]).flat()], user_input: `${label}:${ordinal}`, original_assistant_reply: `online-final:${label}:${ordinal}`, original_model: 'online-model',
     })]);
   }
   const operation = createExperimentService({ query: q, transaction, fetch: fetcher, env });
-  const input = { name: label, sample_set_id: setId, source_environment: 'test', idempotency_key: randomUUID(), variants: [variant('a', turns), variant('b', turns)] };
+  const input = { exclude_last_turn: false, name: label, sample_set_id: setId, source_environment: 'test', run_mode: turns > 1 ? 'multi_turn' : 'single', idempotency_key: randomUUID(), variants: [variant('a', turns), variant('b', turns)] };
   const experiment = await operation('createBatchLabExperiment', input) as any;
   await operation('startBatchLabExperiment', { experiment_id: experiment.id, source_environment: 'test', idempotency_key: randomUUID() });
   return { operation, experiment, input };
@@ -48,6 +54,39 @@ test('creation and start are idempotent; configuration cannot change under a req
   await operation('startBatchLabExperiment', { experiment_id: experiment.id, source_environment: 'test', idempotency_key: randomUUID() });
   const counts = await q(`SELECT count(*)::int AS count FROM lab_attempts WHERE experiment_id=$1`, [experiment.id]);
   assert.equal(counts[0].count, 8);
+});
+
+test('debug runs freeze one random sample across start and result pages', async () => {
+  const { operation, input } = await fixture('random-debug', 1);
+  const experiment: any = await operation('createBatchLabExperiment', {
+    ...input, name: 'random-debug-one', sample_limit: 1, idempotency_key: randomUUID(),
+  });
+  assert.equal(experiment.sample_limit, 1);
+  assert.equal(experiment.selected_sample_ordinals.length, 1);
+  await operation('startBatchLabExperiment', { experiment_id: experiment.id, source_environment: 'test', idempotency_key: randomUUID() });
+  const attempts = await q(`SELECT sample_ordinal FROM lab_attempts WHERE experiment_id=$1 ORDER BY sample_ordinal`, [experiment.id]);
+  assert.equal(attempts.length, 2);
+  assert.deepEqual([...new Set(attempts.map(row => row.sample_ordinal))], experiment.selected_sample_ordinals);
+  const results: any = await operation('getBatchLabExperimentResults', { experimentId: experiment.id, input: { limit: 5 } });
+  assert.deepEqual(results.samples.map((sample: any) => sample.ordinal), experiment.selected_sample_ordinals);
+  const copied: any = await operation('copyBatchLabExperiment', {
+    source_experiment_id: experiment.id, name: 'random-debug-copy', source_environment: 'test', idempotency_key: randomUUID(),
+  });
+  assert.equal(copied.sample_limit, 1);
+  assert.equal(copied.selected_sample_ordinals.length, 1);
+});
+
+test('experiments retain the frozen two-table sources',async()=>{
+  const {operation,input}=await fixture('derived-session-lineage');
+  const source_versions={
+    history:{dataset_version_id:randomUUID(),dataset_version_number:2,dataset_version_name:'聊天',row_count:4},
+    characters:{dataset_version_id:randomUUID(),dataset_version_number:3,dataset_version_name:'角色',row_count:1},
+  };
+  await q("UPDATE lab_records SET data=(data-'dataset_version_id') || $2::jsonb WHERE kind='sample_set' AND id=$1",[input.sample_set_id,JSON.stringify({source_versions})]);
+  const experiment:any=await operation('createBatchLabExperiment',{...input,idempotency_key:randomUUID()});
+  const stored:any=await operation('getBatchLabExperiment',{experimentId:experiment.id});
+  assert.deepEqual(stored.source_versions,source_versions);
+  assert.equal(stored.dataset_version_id,undefined);
 });
 
 test('two claimers never receive the same task; experiments and dependent turns remain isolated', async () => {
@@ -131,7 +170,7 @@ test('expired execution is visible, retry retains history, and the old owner can
   assert.ok(events.filter(event => event.event_type === 'claimed' && event.attempt_id === original.id).length === 2);
 });
 
-test('execution saves actual messages and outputs; reuse display never calls the model again', async () => {
+test('execution saves original output and bypasses legacy processors; rich-text reuse is disabled', async () => {
   let calls = 0;
   const { operation, experiment } = await fixture('reuse', 1, async (_url, init) => {
     calls++;
@@ -139,21 +178,20 @@ test('execution saves actual messages and outputs; reuse display never calls the
     assert.equal(body.temperature, 0.4);
     return Response.json({ id: `generation-${calls}`, choices: [{ message: { content: `saved:${body.messages.at(-1).content}:${body.model}` }, finish_reason: 'stop' }] });
   });
+  const legacyVariants = experiment.variants.map((v:any)=>({...v,processor_version_id:randomUUID()}));
+  await q("UPDATE lab_records SET data=data || $2::jsonb WHERE kind='experiment' AND id=$1",[experiment.id,JSON.stringify({variants:legacyVariants})]);
   const completed = await operation('runBatchLabExperimentWorkerOnce', runInput(experiment.id, 'generation')) as any;
   assert.equal(completed.completed_count, 4);
   const before = await operation('getBatchLabExperimentResults', { experimentId: experiment.id }) as any;
   assert.ok(before.attempts.every((attempt: any) => !('input_messages' in attempt)));
   const persisted = await q(`SELECT data FROM lab_attempts WHERE experiment_id=$1`, [experiment.id]);
   assert.ok(persisted.every((row: any) => row.data.input_messages[0].content === 'context:reuse'));
-  const copied = await operation('createBatchLabReuseDisplayExperiment', { source_experiment_id: experiment.id, name: 'new-display',
-    source_environment: 'test', idempotency_key: randomUUID(), variants: [variant('a', 1), variant('b', 1)] }) as any;
-  await operation('startBatchLabExperiment', { experiment_id: copied.id, source_environment: 'test', idempotency_key: randomUUID() });
-  await operation('runBatchLabExperimentWorkerOnce', runInput(copied.id, 'display-only'));
-  assert.equal(calls, 4);
-  const after = await operation('getBatchLabExperimentResults', { experimentId: copied.id }) as any;
-  assert.deepEqual(after.attempts.map((attempt: any) => attempt.raw_output), before.attempts.map((attempt: any) => attempt.raw_output));
-  assert.ok(after.attempts.every((attempt: any) => attempt.reused_from_attempt_id));
-  assert.ok(after.attempts.every((attempt: any) => attempt.experiment_id === copied.id));
+  assert.ok(persisted.every((row:any)=>row.data.raw_output.startsWith('saved:') && row.data.display_result===null));
+  await assert.rejects(operation('createBatchLabReuseDisplayExperiment', {source_experiment_id:experiment.id}), /暂未开放/);
+  assert.equal(calls,4);
+  const copied:any=await operation('copyBatchLabExperiment',{source_experiment_id:experiment.id,name:'副本',source_environment:'test',idempotency_key:randomUUID()});
+  assert.ok(copied.variants.every((v:any)=>v.processor_version_id===null));
+
 });
 
 test('annotation global targets do not duplicate; exports include global annotations', async () => {
@@ -178,7 +216,7 @@ test('large result pages stay bounded while full Unicode outputs and display dat
   })]);
   await q(`UPDATE lab_snapshots SET data=data || $2::jsonb WHERE sample_set_id=$1`, [experiment.sample_set_id,
     JSON.stringify({ history: [{ role: 'system', content: 's'.repeat(350_000) }] })]);
-  const first = await operation('getBatchLabExperimentResults', { experimentId: experiment.id }) as any;
+  const first = await operation('getBatchLabExperimentResults', { experimentId: experiment.id, input: { limit: 1 } }) as any;
   assert.ok(Buffer.byteLength(JSON.stringify(first)) < 3 * 1024 * 1024);
   assert.equal(first.samples.length, 1);
   assert.equal(first.next_sample_cursor, '1');
@@ -203,11 +241,323 @@ test('large result pages stay bounded while full Unicode outputs and display dat
 
 test('request messages preserve frozen history, and server keys cannot be sent to arbitrary hosts', () => {
   const history = [{ role: 'system' as const, content: 'frozen' }];
-  const messages = buildAttemptMessages(history, ['previous'], 'next', { content: 'brief', format: 'json' });
-  assert.deepEqual(messages.map(message => message.role), ['system', 'system', 'assistant', 'user']);
+  const messages = buildAttemptMessages(history, [], 'next', { content: 'brief', format: 'json' });
+  assert.deepEqual(messages.map(message => message.role), ['system', 'user']);
   assert.equal(history.length, 1);
   assert.equal(modelUrl('https://openrouter.ai/api/v1', {}), 'https://openrouter.ai/api/v1/chat/completions');
   assert.throws(() => modelUrl('https://attacker.example/api/v1', {}), /允许列表/);
   assert.throws(() => modelUrl('http://127.0.0.1', {}), /允许列表/);
   assert.equal(modelUrl('https://models.example/v1', { BATCH_LAB_ALLOWED_MODEL_HOSTS: 'models.example' }), 'https://models.example/v1/chat/completions');
+});
+
+test('replay keeps original user inputs, replaces only the selected replies, and does not duplicate wrapped input', () => {
+  const history = [
+    { role: 'system' as const, content: 'context' },
+    { role: 'user' as const, content: 'outside-window' },
+    { role: 'assistant' as const, content: 'keep-reply' },
+    { role: 'user' as const, content: 'first' },
+    { role: 'assistant' as const, content: 'replace-reply' },
+    { role: 'user' as const, content: '##系统指令:old\n##用户指令:last\n' },
+  ];
+  const frozen = JSON.stringify(history);
+  assert.deepEqual(buildAttemptMessages(history, [], 'last'), [...history.slice(0, 5), { role: 'user', content: 'last' }]);
+  assert.deepEqual(buildAttemptMessages(history, [], 'last', null, 2), history.slice(0, 4));
+  assert.deepEqual(buildAttemptMessages(history, ['new-reply'], 'last', null, 2), [
+    ...history.slice(0, 4), { role: 'assistant', content: 'new-reply' }, { role: 'user', content: 'last' },
+  ]);
+  assert.equal(JSON.stringify(history), frozen);
+  assert.throws(() => buildAttemptMessages([], [], 'last', null, 2), /只有 1 轮/);
+});
+
+test('instruction prompt replaces old wrappers only on replayed turns, as user messages rather than an extra system message', () => {
+  const wrap = (input: string) => `##系统指令：旧指令\n内容\n##用户指令:\n${input}\n`;
+  const history = [
+    { role: 'system' as const, content: 'original-system' },
+    { role: 'user' as const, content: wrap('earlier') },
+    { role: 'assistant' as const, content: 'keep' },
+    { role: 'user' as const, content: wrap('first-replay') },
+    { role: 'assistant' as const, content: 'replace' },
+    { role: 'user' as const, content: wrap('last') },
+  ];
+  const saved = JSON.stringify(history);
+  const prompt = '##系统指令：新指令\n##用户指令:';
+  const first = buildAttemptMessages(history, [], 'last', { content: prompt, format: 'must-not-duplicate' }, 2);
+  assert.deepEqual(first, [history[0], { role: 'user', content: 'earlier' }, history[2],
+    { role: 'user', content: `${prompt}\nfirst-replay` }]);
+  const second = buildAttemptMessages(history, ['fresh'], 'last', { content: prompt }, 2);
+  assert.deepEqual(second, [...first, { role: 'assistant', content: 'fresh' }, { role: 'user', content: `${prompt}\nlast` }]);
+  assert.equal(JSON.stringify(history), saved);
+  assert.equal(pureUserInput('  plain user text  '), '  plain user text  ');
+  assert.equal(pureUserInput(wrap('  keep spaces  ')), '  keep spaces  ');
+  assert.equal(pureUserInput('##系统指令:old\r\n\\##用户指令：\r\nhello\r\n'), 'hello');
+  assert.equal(withInstructionPrompt('unchanged', 'new instruction'), 'new instruction\n\n##用户指令:\nunchanged');
+});
+
+test('single mode normalizes stale turn counts and schedules only the final reply', async () => {
+  const { operation, input } = await fixture('single-normalization', 3);
+  const experiment: any = await operation('createBatchLabExperiment', { ...input, run_mode: 'single', idempotency_key: randomUUID() });
+  assert.ok(experiment.variants.every((item: any) => item.max_turns === 1));
+  await operation('startBatchLabExperiment', { experiment_id: experiment.id, source_environment: 'test', idempotency_key: randomUUID() });
+  await operation('runBatchLabExperimentWorkerOnce', runInput(experiment.id, 'single-worker'));
+  const rows = await q(`SELECT data FROM lab_attempts WHERE experiment_id=$1`, [experiment.id]);
+  assert.equal(rows.length, 4);
+  assert.ok(rows.every(row => row.data.input_messages.some((message: any) => message.content === 'old-reply-1')));
+  assert.ok(rows.every(row => row.data.input_messages.at(-1).content === `single-normalization:${row.data.sample_ordinal}`));
+});
+
+test('continuous execution feeds each variant its own new replies and advances original inputs', async () => {
+  const { operation, experiment } = await fixture('replay', 3);
+  for (let turn = 1; turn <= 3; turn++) {
+    await operation('runBatchLabExperimentWorkerOnce', runInput(experiment.id, `replay-${turn}`));
+  }
+  const rows = await q(`SELECT data FROM lab_attempts WHERE experiment_id=$1 ORDER BY turn_index`, [experiment.id]);
+  assert.equal(rows.length, 12);
+  for (const { data } of rows) {
+    const expected = `replay:${data.sample_ordinal}${data.turn_index < 3 ? `:earlier-${data.turn_index - 1}` : ''}`;
+    assert.equal(data.status, 'succeeded');
+    assert.equal(data.replay_user_input, expected);
+    assert.equal(data.input_messages.at(-1).content, expected);
+    const replies = data.input_messages.filter((message: any) => message.role === 'assistant');
+    assert.equal(replies.length, data.turn_index - 1);
+    assert.ok(replies.every((message: any) => message.content.startsWith(`result:test/${data.variant_key}:replay:${data.sample_ordinal}`)));
+  }
+});
+
+test('insufficient original turns rejects the entire start before scheduling any calls', async () => {
+  const { operation, input } = await fixture('short-history', 1);
+  const experiment: any = await operation('createBatchLabExperiment', { ...input, run_mode: 'multi_turn', variants: [variant('a', 3), variant('b', 3)], idempotency_key: randomUUID() });
+  await assert.rejects(operation('startBatchLabExperiment', { experiment_id: experiment.id, source_environment: 'test', idempotency_key: randomUUID() }), /无法重跑最后 3 轮/);
+  const rows = await q(`SELECT id FROM lab_attempts WHERE experiment_id=$1`, [experiment.id]);
+  assert.equal(rows.length, 0);
+});
+
+test('either fixed variant reuses the matching original reply at every turn without model calls', async () => {
+  for (const fixedKey of ['a', 'b']) {
+    let calls = 0;
+    const { operation, input } = await fixture(`fixed-${fixedKey}`, 3, async (_url, init) => {
+      calls++;
+      const body = JSON.parse(String(init?.body));
+      assert.equal(body.model, `test/${fixedKey === 'a' ? 'b' : 'a'}`);
+      return Response.json({ choices: [{ message: { content: `new:${calls}` }, finish_reason: 'stop' }] });
+    });
+    const experiment: any = await operation('createBatchLabExperiment', { ...input, idempotency_key: randomUUID(),
+      variants: input.variants.map(v => ({ ...v, generation_mode: v.key === fixedKey ? 'original' : 'generate' })) });
+    const start = { experiment_id: experiment.id, source_environment: 'test', idempotency_key: randomUUID() };
+    await operation('startBatchLabExperiment', start);
+    await operation('startBatchLabExperiment', start);
+    const before: any = await operation('getBatchLabExperimentResults', { experimentId: experiment.id });
+    assert.equal(before.progress.completed_attempts, 6);
+    assert.equal(calls, 0);
+    const fixed = before.attempts.filter((attempt: any) => attempt.variant_key === fixedKey);
+    assert.equal(fixed.length, 6);
+    for (const row of fixed) {
+      assert.equal(row.raw_output, row.turn_index === 3 ? `online-final:fixed-${fixedKey}:${row.sample_ordinal}` : `old-reply-${row.turn_index - 1}`);
+      assert.equal(row.finish_reason, 'original_reused');
+    }
+    for (let turn = 0; turn < 3; turn++) await operation('runBatchLabExperimentWorkerOnce', runInput(experiment.id, `fixed-worker-${turn}`));
+    assert.equal(calls, 6);
+    const after: any = await operation('getBatchLabExperimentResults', { experimentId: experiment.id });
+    assert.equal(after.experiment.status, 'completed');
+    assert.equal(after.samples[0].replay_start_index, 1);
+    assert.ok(after.attempts.filter((row: any) => row.variant_key === fixedKey).every((row: any) => row.attempt_count === 0));
+  }
+});
+
+test('both original groups finish immediately; missing original data never falls back to generation', async () => {
+  const { operation, input } = await fixture('fixed-only', 1, async () => { throw new Error('must not call model'); });
+  const create = { ...input, variants: input.variants.map(v => ({ ...v, generation_mode: 'original' })) };
+  const experiment: any = await operation('createBatchLabExperiment', { ...create, idempotency_key: randomUUID() });
+  const started: any = await operation('startBatchLabExperiment', { experiment_id: experiment.id, source_environment: 'test', idempotency_key: randomUUID() });
+  assert.equal(started.status, 'completed');
+  assert.equal(started.completed_attempts, 4);
+  await q(`UPDATE lab_snapshots SET data=data-'original_assistant_reply' WHERE sample_set_id=$1`, [input.sample_set_id]);
+  const missing: any = await operation('createBatchLabExperiment', { ...create, idempotency_key: randomUUID() });
+  await assert.rejects(operation('startBatchLabExperiment', { experiment_id: missing.id, source_environment: 'test', idempotency_key: randomUUID() }), /缺少原始线上回复/);
+  assert.equal((await q('SELECT id FROM lab_attempts WHERE experiment_id=$1', [missing.id])).length, 0);
+});
+
+test('per-turn preferences persist, update, and remain isolated across samples, turns, and experiments', async () => {
+  const { operation, experiment } = await fixture('preferences', 2);
+  const input = { experiment_id: experiment.id, sample_ordinal: 0, turn_index: 1, tag: 'preference:a', note: null, source_environment: 'test' };
+  await assert.rejects(operation('upsertBatchLabAnnotation', input), /完成后才能评价/);
+  await operation('runBatchLabExperimentWorkerOnce', runInput(experiment.id, 'preferences-1'));
+  await operation('runBatchLabExperimentWorkerOnce', runInput(experiment.id, 'preferences-2'));
+  await operation('upsertBatchLabAnnotation', input);
+  await operation('upsertBatchLabAnnotation', { ...input, tag: 'preference:b' });
+  await operation('upsertBatchLabAnnotation', { ...input, turn_index: 2, tag: 'preference:tie' });
+  await operation('upsertBatchLabAnnotation', { ...input, sample_ordinal: 1 });
+  await assert.rejects(operation('upsertBatchLabAnnotation', { ...input, tag: 'preference:unknown' }), /有效/);
+  const result: any = await operation('getBatchLabExperimentResults', { experimentId: experiment.id });
+  assert.equal(result.annotations.length, 3);
+  assert.equal(result.annotations.find((row: any) => row.sample_ordinal === 0 && row.turn_index === 1).tag, 'preference:b');
+  const exported: any = await operation('downloadBatchLabExperimentJsonl', { experimentId: experiment.id });
+  assert.match(exported, /preference:b/);
+  const other = await fixture('other-preferences', 1);
+  assert.equal(((await other.operation('getBatchLabExperimentResults', { experimentId: other.experiment.id })) as any).annotations.length, 0);
+  await operation('upsertBatchLabAnnotation', { ...input, tag: null });
+  const cleared: any = await operation('getBatchLabExperimentResults', { experimentId: experiment.id });
+  assert.equal(cleared.annotations.find((row: any) => row.sample_ordinal === 0 && row.turn_index === 1).tag, null);
+});
+
+test('new experiments drop the final source turn and align generated and original groups on preceding turns', async () => {
+  const requests: any[] = [];
+  const { operation, input } = await fixture('exclude-final', 3, async (_url, init) => {
+    const body = JSON.parse(String(init?.body)); requests.push(body);
+    return Response.json({ choices: [{ message: { content: 'new reply' }, finish_reason: 'stop' }] });
+  });
+  for (const mode of ['single', 'multi_turn']) {
+    const experiment: any = await operation('createBatchLabExperiment', { ...input, exclude_last_turn: undefined,
+      run_mode: mode, idempotency_key: randomUUID(), variants: [
+        { ...variant('a', 2), generation_mode: 'original' },
+        { ...variant('b', 2), output_preset: { name: 'new', content: 'new instruction', format: '' } },
+      ] });
+    assert.equal(experiment.exclude_last_turn, true);
+    await operation('startBatchLabExperiment', { experiment_id: experiment.id, source_environment: 'test', idempotency_key: randomUUID() });
+    for (let turn = 0; turn < (mode === 'single' ? 1 : 2); turn++) await operation('runBatchLabExperimentWorkerOnce', runInput(experiment.id, `exclude-${turn}`));
+    const result: any = await operation('getBatchLabExperimentResults', { experimentId: experiment.id });
+    assert.equal(result.experiment.status, 'completed');
+    assert.equal(result.samples[0].user_input, 'exclude-final:0:earlier-1');
+    assert.equal(result.samples[0].original_assistant_reply, 'old-reply-1');
+    for (const row of result.attempts.filter((item: any) => item.variant_key === 'a')) {
+      assert.equal(row.raw_output, `old-reply-${mode === 'single' ? 1 : row.turn_index - 1}`);
+    }
+  }
+  assert.equal(requests.length, 6);
+  assert.ok(requests.every(body => body.messages.at(-1).content.startsWith('new instruction\n\n##用户指令:\nexclude-final:')));
+  assert.ok(requests.every(body => body.messages.at(-1).content.includes(':earlier-')));
+  const original = (await q('SELECT data FROM lab_snapshots WHERE sample_set_id=$1 AND ordinal=0', [input.sample_set_id]))[0].data;
+  assert.equal(original.user_input, 'exclude-final:0');
+  assert.equal(original.original_assistant_reply, 'online-final:exclude-final:0');
+  const saved = JSON.stringify(original);
+  const derived = excludeLastTurn({ ...original, turn_index: 43 });
+  assert.equal(derived.turn_index, 42);
+  assert.equal(JSON.stringify(original), saved);
+  assert.throws(() => excludeLastTurn({ history: [], user_input: 'only turn' }), /没有可用/);
+});
+
+test('saved concurrency controls parallel calls, supports more than four, and survives copying', async () => {
+  for (const concurrency of [1, 6]) {
+    let started = 0;
+    let entered!: () => void, release!: () => void;
+    const ready = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const { operation, input, experiment: defaultExperiment } = await fixture('concurrency', 1, async () => {
+      started++;
+      if (started === concurrency) entered();
+      await gate;
+      return Response.json({ choices: [{ message: { content: 'done' }, finish_reason: 'stop' }] });
+    });
+    assert.equal(defaultExperiment.concurrency, 4);
+    await q(`INSERT INTO lab_snapshots(sample_set_id,ordinal,data)
+      SELECT sample_set_id,n,data FROM lab_snapshots CROSS JOIN generate_series(2,5) n WHERE sample_set_id=$1 AND ordinal=0`, [input.sample_set_id]);
+    const experiment: any = await operation('createBatchLabExperiment', { ...input, concurrency, idempotency_key: randomUUID() });
+    await operation('startBatchLabExperiment', { experiment_id: experiment.id, source_environment: 'test', idempotency_key: randomUUID() });
+    const running = operation('runBatchLabExperimentWorkerOnce', runInput(experiment.id, 'parallel', 20));
+    await ready;
+    assert.equal(started, concurrency);
+    release();
+    const result: any = await running;
+    assert.equal(result.claimed_count, concurrency);
+    assert.equal(result.completed_count, concurrency);
+    const copied: any = await operation('copyBatchLabExperiment', { source_experiment_id: experiment.id, name: 'copy', source_environment: 'test', idempotency_key: randomUUID() });
+    assert.equal(copied.concurrency, concurrency);
+    const maximum: any = await operation('createBatchLabExperiment', { ...input, concurrency: 100, idempotency_key: randomUUID() });
+    assert.equal(maximum.concurrency, 100);
+    await assert.rejects(operation('createBatchLabExperiment', { ...input, concurrency: 101, idempotency_key: randomUUID() }));
+  }
+});
+
+test('model comparison uses a manual shared prompt and identical request settings except model', async () => {
+  const requests: any[] = [];
+  const { operation, input } = await fixture('model-variable', 1, async (_url, init) => {
+    requests.push(JSON.parse(String(init?.body)));
+    return Response.json({ choices: [{ message: { content: 'model result' }, finish_reason: 'stop' }] });
+  });
+  const shared = { name: 'manual', content: 'Manually supplied instruction', format: '' };
+  const experiment: any = await operation('createBatchLabExperiment', { ...input, comparison_variable: 'model', output_preset: shared,
+    variants: [{ ...variant('a', 1), model_source: 'sample', generation_mode: 'original' },
+      { ...variant('b', 1), output_preset: { ...shared, content: 'must not override shared prompt' }, sampling: { temperature: 1.2 } }],
+    idempotency_key: randomUUID() });
+  assert.ok(experiment.variants.every((v: any) => v.generation_mode === 'generate' && v.output_preset.content === shared.content));
+  await operation('startBatchLabExperiment', { experiment_id: experiment.id, source_environment: 'test', idempotency_key: randomUUID() });
+  await operation('runBatchLabExperimentWorkerOnce', runInput(experiment.id, 'models'));
+  assert.equal(requests.length, 4);
+  for (const ordinal of [0, 1]) {
+    const pair = requests.filter(body => body.messages.at(-1).content.endsWith(`model-variable:${ordinal}`));
+    assert.equal(pair.length, 2);
+    assert.deepEqual(pair.map(body => body.model).sort(), ['online-model', 'test/b']);
+    assert.deepEqual(pair[0].messages, pair[1].messages);
+    assert.deepEqual({ ...pair[0], model: null }, { ...pair[1], model: null });
+    assert.match(pair[0].messages.at(-1).content, /^Manually supplied instruction/);
+  }
+  const result: any = await operation('getBatchLabExperimentResults', { experimentId: experiment.id });
+  assert.equal(result.experiment.comparison_variable, 'model');
+  assert.ok(result.attempts.every((a: any) => a.request_model === (a.variant_key === 'a' ? 'online-model' : 'test/b')));
+  const copied: any = await operation('copyBatchLabExperiment', { source_experiment_id: experiment.id, name: 'models copy', source_environment: 'test', idempotency_key: randomUUID() });
+  assert.equal(copied.comparison_variable, 'model');
+  assert.equal(copied.output_preset.content, shared.content);
+  await assert.rejects(operation('createBatchLabExperiment', { ...input, comparison_variable: 'model', idempotency_key: randomUUID() }), /手动填写/);
+});
+
+test('instruction comparison fixes the sample model while retaining the two manual instructions', async () => {
+  const requests: any[] = [];
+  const { operation, input } = await fixture('instruction-variable', 1, async (_url, init) => {
+    requests.push(JSON.parse(String(init?.body)));
+    return Response.json({ choices: [{ message: { content: 'instruction result' }, finish_reason: 'stop' }] });
+  });
+  const experiment: any = await operation('createBatchLabExperiment', { ...input, comparison_variable: 'instruction_prompt',
+    variants: input.variants.map(v => ({ ...v, output_preset: { name: v.key, content: `instruction-${v.key}`, format: '' } })), idempotency_key: randomUUID() });
+  await operation('startBatchLabExperiment', { experiment_id: experiment.id, source_environment: 'test', idempotency_key: randomUUID() });
+  await operation('runBatchLabExperimentWorkerOnce', runInput(experiment.id, 'instructions'));
+  assert.equal(requests.length, 4);
+  assert.ok(requests.every(body => body.model === 'online-model'));
+  assert.equal(new Set(requests.map(body => body.messages.at(-1).content.split('\n')[0])).size, 2);
+});
+
+test('comparison summary covers every page, groups model pairs, and updates amended or cleared votes', async () => {
+  const { operation, experiment } = await fixture('summary', 2);
+  const vote = (ordinal: number, turn: number, tag: string | null) => operation('upsertBatchLabAnnotation', {
+    experiment_id: experiment.id, sample_ordinal: ordinal, turn_index: turn, tag, note: null, source_environment: 'test',
+  });
+  await operation('runBatchLabExperimentWorkerOnce', runInput(experiment.id, 'summary-first'));
+  await vote(0, 1, 'preference:a');
+  await vote(1, 1, 'preference:tie');
+  const page: any = await operation('getBatchLabExperimentResults', { experimentId: experiment.id, input: { limit: 1 } });
+  assert.equal(page.samples.length, 1);
+  const { by_model, ...totals } = page.comparison_summary;
+  assert.deepEqual(totals, { total: 4, a_wins: 1, b_wins: 0, ties: 1, unrated: 2, awaiting_results: 2 });
+  const modelPair = by_model.find((row: any) => row.model_a === 'test/a' && row.model_b === 'test/b');
+  assert.equal(modelPair.a_wins, 1);
+  assert.equal(modelPair.ties, 1);
+  await operation('runBatchLabExperimentWorkerOnce', runInput(experiment.id, 'summary-second'));
+  await vote(0, 1, 'preference:b');
+  await vote(1, 1, null);
+  const after: any = await operation('getBatchLabExperimentResults', { experimentId: experiment.id, input: { limit: 1, cursor: '1' } });
+  assert.deepEqual(after.comparison_summary, { total: 4, a_wins: 0, b_wins: 1, ties: 0, unrated: 3, awaiting_results: 0,
+    by_model: [{ model_a: 'test/a', model_b: 'test/b', total: 4, a_wins: 0, b_wins: 1, ties: 0, unrated: 3, awaiting_results: 0 }] });
+});
+
+test('per-turn models stay aligned after startup truncation and last-turn exclusion',async()=>{
+  const {operation,input}=await fixture('per-turn-models',2);
+  const history=[{role:'system',content:'shared'}];
+  const turn_models=[];
+  for(let turn=1;turn<=8;turn++){
+    const user_message_index=history.length;
+    history.push({role:'user',content:`user-${turn}`});
+    const assistant_message_indices=turn<8?[history.length]:[];
+    if(turn<8)history.push({role:'assistant',content:`original-${turn}`});
+    turn_models.push({turn_index:turn,user_message_index,assistant_message_indices,source_history_id:randomUUID(),model:`model/${turn}`,llm_model:null});
+  }
+  await q(`UPDATE lab_snapshots SET data=data || $2::jsonb WHERE sample_set_id=$1`,[input.sample_set_id,JSON.stringify({history,user_input:'user-8',turn_index:8,original_model:'model/8',original_assistant_reply:'original-8',turn_models})]);
+  const experiment:any=await operation('createBatchLabExperiment',{...input,idempotency_key:randomUUID(),exclude_last_turn:true,comparison_variable:'instruction_prompt',variants:[{...variant('a',2),generation_mode:'original',model_source:'sample'},{...variant('b',2),generation_mode:'generate',model_source:'sample'}]});
+  await operation('startBatchLabExperiment',{experiment_id:experiment.id,source_environment:'test',idempotency_key:randomUUID()});
+  await operation('runBatchLabExperimentWorkerOnce',runInput(experiment.id,'turn-model-worker',10));
+  await operation('runBatchLabExperimentWorkerOnce',runInput(experiment.id,'turn-model-worker',10));
+  const attempts=await q(`SELECT variant_key,turn_index,status,data FROM lab_attempts WHERE experiment_id=$1 ORDER BY sample_ordinal,variant_key,turn_index`,[experiment.id]);
+  assert.equal(attempts.length,8);
+  for(const attempt of attempts){
+    assert.equal(attempt.status,'succeeded');
+    assert.equal(attempt.data.request_model,`model/${attempt.turn_index+5}`);
+    if(attempt.variant_key==='a')assert.equal(attempt.data.source_model_verified,true);
+  }
 });

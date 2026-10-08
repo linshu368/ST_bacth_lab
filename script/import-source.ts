@@ -7,7 +7,7 @@ import { Transform } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import Papa from 'papaparse';
 import { z } from 'zod';
-import { CHUNK_BYTES, SOURCE_KINDS, datasetProvenanceSchema, type SourceRow } from '../server/datasets';
+import { CHUNK_BYTES, SOURCE_KINDS, datasetProvenanceSchema, validateSourceKinds, type SourceRow } from '../server/datasets';
 import { query as databaseQuery } from '../server/db';
 
 type Kind = typeof SOURCE_KINDS[number];
@@ -20,7 +20,7 @@ const sourceManifestSchema = z.object({
     kind: z.enum(SOURCE_KINDS), path: z.string().min(1).max(500),
     size: z.number().int().positive().safe().optional(),
     sha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
-  }).strict()).length(3),
+  }).strict()).min(2).max(3),
   provenance: datasetProvenanceSchema,
 }).strict();
 
@@ -31,7 +31,7 @@ type PreparedImport = { manifest: Manifest; files: FileSummary[] };
 
 function requiredFields(kind: Kind): string[][] {
   return kind === 'history'
-    ? [['id'], ['session_id', 'source_session_id'], ['character_id', 'source_character_id'], ['user_input'], ['model', 'original_model']]
+    ? [['id'], ['character_id', 'source_character_id'], ['user_input'], ['model', 'original_model']]
     : [['id']];
 }
 
@@ -103,7 +103,7 @@ export async function prepareSourceImport(manifestPath: string): Promise<Prepare
   const resolvedManifest = await realpath(manifestPath);
   const directory = path.dirname(resolvedManifest);
   const manifest = sourceManifestSchema.parse(JSON.parse(await readFile(resolvedManifest, 'utf8')));
-  if (new Set(manifest.files.map(file => file.kind)).size !== 3) throw new Error('来源清单必须包含三个不同种类的 CSV');
+  validateSourceKinds(manifest.files);
   const files: FileSummary[] = [];
   for (const definition of manifest.files) {
     if (path.isAbsolute(definition.path)) throw new Error('CSV 必须使用清单目录内的相对路径');
@@ -113,7 +113,8 @@ export async function prepareSourceImport(manifestPath: string): Promise<Prepare
     if (!(await stat(resolved)).isFile()) throw new Error('CSV 路径不是普通文件');
     const scanned = await scanSourceCsv(resolved, definition.kind);
     if (!scanned.size) throw new Error(`${definition.kind} CSV 文件为空`);
-    if (scanned.rows !== manifest.provenance.row_counts[definition.kind]) throw new Error(`${definition.kind} 实际行数 ${scanned.rows} 与来源清单 ${manifest.provenance.row_counts[definition.kind]} 不一致`);
+    const declaredRows = manifest.provenance.row_counts[definition.kind];
+    if (declaredRows !== undefined && scanned.rows !== declaredRows) throw new Error(`${definition.kind} 实际行数 ${scanned.rows} 与来源清单 ${declaredRows} 不一致`);
     if (definition.size !== undefined && scanned.size !== definition.size) throw new Error(`${definition.kind} 文件大小与来源清单不一致`);
     if (definition.sha256 !== undefined && scanned.sha256 !== definition.sha256) throw new Error(`${definition.kind} 文件校验值与来源清单不一致`);
     files.push({ kind: definition.kind, name: path.basename(resolved), path: resolved, ...scanned, chunks: Math.ceil(scanned.size / CHUNK_BYTES) });
@@ -243,13 +244,12 @@ export async function importSourceFiles(manifestPath: string, options: { dryRun?
     if (Number(saved.count) !== file.chunks || saved.first !== 0 || Number(saved.last) !== file.chunks - 1) throw new Error(`${file.kind} 原始分片校验失败`);
   }
   const [previewable] = await execute(`SELECT count(*)::int AS count FROM lab_source_rows h
-    JOIN lab_source_rows s ON s.dataset_id=h.dataset_id AND s.kind='sessions' AND s.row_id=coalesce(nullif(h.data->>'session_id',''),h.data->>'source_session_id')
     JOIN lab_source_rows c ON c.dataset_id=h.dataset_id AND c.kind='characters' AND c.row_id=coalesce(nullif(h.data->>'character_id',''),h.data->>'source_character_id')
     WHERE h.dataset_id=$1 AND h.kind='history' AND coalesce(h.data->>'user_input','')<>''
-      AND coalesce(nullif(h.data->>'model',''),h.data->>'original_model','')<>'' AND coalesce(s.data->>'deleted_at','')=''`, [dataset.id]);
+      AND coalesce(nullif(h.data->>'model',''),h.data->>'original_model','')<>''`, [dataset.id]);
   const counts = {
-    history_count: manifest.provenance.row_counts.history, session_count: manifest.provenance.row_counts.sessions,
-    character_count: manifest.provenance.row_counts.characters, previewable_history_count: Number(previewable.count),
+    history_count: files.find(file => file.kind === 'history')!.rows, session_count: files.find(file => file.kind === 'sessions')?.rows ?? 0,
+    character_count: files.find(file => file.kind === 'characters')!.rows, previewable_history_count: Number(previewable.count),
   };
   const [ready] = await execute("UPDATE lab_datasets SET status='ready',counts=$2::jsonb,ready_at=coalesce(ready_at,now()) WHERE id=$1 RETURNING id,version,status,counts", [dataset.id, JSON.stringify(counts)]);
   return { ...ready, version: Number(ready.version), provenance: manifest.provenance };

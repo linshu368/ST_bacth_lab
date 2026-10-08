@@ -7,13 +7,11 @@ const DATASET = '11111111-1111-4111-8111-111111111111';
 const OTHER_DATASET = '22222222-2222-4222-8222-222222222222';
 const DEFAULT_SQL = `SELECT h.id AS source_history_id
 FROM experience.chat_history AS h
-JOIN experience.chat_sessions AS s ON s.id = h.session_id
 JOIN app_core.characters AS c ON c.id = h.character_id
 WHERE h.user_input IS NOT NULL
   AND h.model IS NOT NULL
   AND h.turn_index >= :min_turn
   AND h.revision >= 0
-  AND s.deleted_at IS NULL
 ORDER BY h.created_at DESC`;
 const SIMPLE_SQL = 'SELECT h.id AS source_history_id FROM experience.chat_history AS h';
 const injectionText = "中文 ':missing'; DROP TABLE public.lab_source_rows; --";
@@ -65,8 +63,8 @@ async function anchors(sql: string, parameters: Record<string, unknown> = {}, sa
 test('executes the default SQL and binds the immutable source version', async () => {
   const query = compile(DEFAULT_SQL, { min_turn: 3 });
   assert.deepEqual(query.values, [DATASET, 3, 51]);
-  assert.equal((query.text.match(/dataset_id = \$1::uuid/g) ?? []).length, 3);
-  assert.deepEqual(await anchors(DEFAULT_SQL, { min_turn: 3 }), ['h2']);
+  assert.equal((query.text.match(/dataset_id = \$1::uuid/g) ?? []).length, 2);
+  assert.deepEqual(await anchors(DEFAULT_SQL, { min_turn: 3 }), ['h3', 'h2']);
   const otherQuery = compileDatasetQuery({ datasetId: OTHER_DATASET, sql: DEFAULT_SQL, parameters: { min_turn: 3 }, sampleLimit: 50 });
   const other = await db.query<{ source_history_id: string }>(otherQuery.text, otherQuery.values);
   assert.deepEqual(other.rows, [{ source_history_id: 'h1' }]);
@@ -78,6 +76,17 @@ test('SQL WHERE and ORDER BY actually change the selected anchors and order', as
   assert.deepEqual(await anchors(ascending, { min: 1, max: 3 }), ['h1', 'h5', 'h2']);
   assert.deepEqual(await anchors(descending, { min: 1, max: 3 }), ['h2', 'h5', 'h1']);
   assert.deepEqual(await anchors(ascending, { min: 3, max: 3 }), ['h2']);
+});
+
+test('each logical table reads only its explicitly selected version', async () => {
+  const sql = `${DEFAULT_SQL.replace('ORDER BY h.created_at DESC', '')} AND c.enabled = :enabled ORDER BY h.id`;
+  const selection = { history: DATASET, characters: OTHER_DATASET };
+  const compiled = compileDatasetQuery({datasetIds:selection,sql,parameters:{min_turn:1,enabled:false},sampleLimit:50});
+  const result = await db.query<{source_history_id:string}>(compiled.text, compiled.values);
+  assert.deepEqual(result.rows.map(row=>row.source_history_id), ['h1','h2','h3','h5']);
+  const switched = compileDatasetQuery({datasetIds:{...selection,characters:DATASET},sql,parameters:{min_turn:1,enabled:false},sampleLimit:50});
+  assert.deepEqual((await db.query(switched.text,switched.values)).rows, []);
+  assert.throws(()=>compileDatasetQuery({datasetIds:{history:DATASET} as any,sql,parameters:{},sampleLimit:50}), /两张表/);
 });
 
 test('outer cap returns at most sampleLimit + 1 and respects a smaller SQL LIMIT', async () => {
@@ -128,6 +137,12 @@ test('schema-qualified columns and unqualified allowed table names are rewritten
   assert.deepEqual(await anchors('SELECT id AS source_history_id FROM chat_history WHERE id = :id', { id: 'h1' }), ['h1']);
 });
 
+test('random sorting is allowed only as a zero-argument builtin and stays within the selected version', async () => {
+  const sql=`${SIMPLE_SQL} WHERE h.turn_index > 1 ORDER BY random()`;
+  assert.match(compile(sql).text,/pg_catalog\.random/);
+  assert.deepEqual((await anchors(sql)).sort(),['h2','h3','h5']);
+});
+
 const rejectedSql = [
   'DELETE FROM experience.chat_history',
   'UPDATE experience.chat_history SET user_input = \'changed\'',
@@ -161,6 +176,11 @@ const rejectedSql = [
   "SELECT 'invented' AS source_history_id FROM experience.chat_history h",
   'SELECT h.user_input AS source_history_id FROM experience.chat_history h',
   `${SIMPLE_SQL} WHERE h.id = $1`,
+  `${SIMPLE_SQL} ORDER BY random(1)`,
+  `${SIMPLE_SQL} ORDER BY public.random()`,
+  `${SIMPLE_SQL} ORDER BY pg_sleep(1)`,
+  `${SIMPLE_SQL} ORDER BY random() + 1`,
+  `${SIMPLE_SQL} WHERE random() > 0`,
 ];
 
 for (const sql of rejectedSql) {

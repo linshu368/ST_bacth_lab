@@ -153,32 +153,31 @@ export function processorOptionLabel(processor: BatchLabProcessorVersion): strin
 export function variantDiffRows(a: BatchLabExperimentVariant, b: BatchLabExperimentVariant) {
   return [
     {
+      key: 'generation_mode', label: '回复来源',
+      baseline: a.generation_mode === 'original' ? '原始线上回复（固定）' : '重新生成',
+      candidate: b.generation_mode === 'original' ? '原始线上回复（固定）' : '重新生成',
+    },
+    {
       key: 'provider_base_url',
       label: 'OpenRouter URL',
-      baseline: a.provider_config?.base_url ?? '未设置',
-      candidate: b.provider_config?.base_url ?? '未设置',
+      baseline: a.generation_mode === 'original' ? '不调用模型' : a.provider_config?.base_url ?? '未设置',
+      candidate: b.generation_mode === 'original' ? '不调用模型' : b.provider_config?.base_url ?? '未设置',
     },
     {
       key: 'openrouter_model_id',
       label: '模型名称',
-      baseline: a.openrouter_model_id,
-      candidate: b.openrouter_model_id,
+      baseline: a.generation_mode === 'original' || a.model_source === 'sample' ? '样本原始模型' : a.openrouter_model_id,
+      candidate: b.generation_mode === 'original' || b.model_source === 'sample' ? '样本原始模型' : b.openrouter_model_id,
     },
     {
       key: 'output_preset',
-      label: '输出预设',
-      baseline: a.output_preset?.content ?? '未设置',
-      candidate: b.output_preset?.content ?? '未设置',
-    },
-    {
-      key: 'processor',
-      label: '对应后处理',
-      baseline: a.processor_version_id ?? '不处理',
-      candidate: b.processor_version_id ?? '不处理',
+      label: 'Instruction prompt',
+      baseline: a.generation_mode === 'original' ? '保持线上结果' : a.output_preset?.content ?? '未设置',
+      candidate: b.generation_mode === 'original' ? '保持线上结果' : b.output_preset?.content ?? '未设置',
     },
     {
       key: 'max_turns',
-      label: '重跑轮数',
+      label: '对比轮数',
       baseline: String(a.max_turns),
       candidate: String(b.max_turns),
     },

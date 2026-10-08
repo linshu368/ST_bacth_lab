@@ -101,3 +101,51 @@ test('wrong row counts, secret fields, timezone mismatches and escaping paths fa
     await assert.rejects(() => prepareSourceImport(file));
   }
 });
+
+test('two-file imports accept history without session IDs and count eligibility from history plus characters only', async () => {
+  const history = Buffer.from(Papa.unparse([
+    { id: 'two-h1', user_id: 'u1', character_id: 'c1', created_at: '2026-09-24T01:00:00Z', user_input: '有效', model: 'test', history: '[]' },
+    { id: 'two-h2', user_id: 'u1', character_id: 'missing', created_at: '2026-09-24T01:01:00Z', user_input: '缺角色', model: 'test', history: '[]' },
+    { id: 'two-h3', user_id: 'u2', character_id: 'c1', created_at: '2026-09-24T01:02:00Z', user_input: '缺模型', model: '', history: '[]' },
+  ]));
+  await writeFile(path.join(directory, 'two-history.csv'), history);
+  const twoFileManifest = {
+    ...manifest, name: '两文件无会话输入', idempotency_key: randomUUID(),
+    files: [{ kind: 'history', path: 'two-history.csv' }, { kind: 'characters', path: 'characters.csv' }],
+    provenance: { ...provenance, row_counts: { history: 3, characters: 1 } },
+  };
+  const file = path.join(directory, 'two-file-manifest.json');
+  await writeFile(file, JSON.stringify(twoFileManifest));
+  const prepared = await prepareSourceImport(file);
+  assert.deepEqual(prepared.files.map(item => item.kind), ['history', 'characters']);
+  const result = await importSourceFiles(file, { execute });
+  assert.deepEqual(result.counts, { history_count: 3, session_count: 0, character_count: 1, previewable_history_count: 1 });
+  const [sessions] = await execute("SELECT count(*)::int AS count FROM lab_source_rows WHERE dataset_id=$1 AND kind='sessions'", [result.id]);
+  assert.equal(sessions.count, 0);
+  const originals = await execute("SELECT data FROM lab_source_chunks WHERE dataset_id=$1 AND kind='history' ORDER BY chunk_index", [result.id]);
+  assert.deepEqual(Buffer.concat(originals.map(row => Buffer.from(row.data, 'base64'))), history);
+});
+
+test('legacy sessions metadata is optional and never invents imported sessions for a two-file manifest', async () => {
+  const file = path.join(directory, 'legacy-count-with-two-files.json');
+  await writeFile(file, JSON.stringify({
+    ...manifest, name: '旧来源信息两文件', idempotency_key: randomUUID(),
+    files: manifest.files.filter((item: any) => item.kind !== 'sessions'),
+    provenance: { ...provenance, row_counts: { ...provenance.row_counts, sessions: 700 } },
+  }));
+  const result = await importSourceFiles(file, { execute });
+  assert.equal(result.counts.session_count, 0);
+  assert.equal(result.counts.previewable_history_count, 2);
+  assert.equal(result.provenance.row_counts.sessions, 700, 'keep the legacy provenance rather than rewriting its historical counts');
+});
+
+test('source manifests require both history and characters and reject duplicate kinds', async () => {
+  for (const [label, files] of [
+    ['missing-character', [{ kind: 'history', path: 'history.csv' }, { kind: 'sessions', path: 'sessions.csv' }]],
+    ['duplicate-history', [{ kind: 'history', path: 'history.csv' }, { kind: 'history', path: 'history.csv' }, { kind: 'characters', path: 'characters.csv' }]],
+  ] as const) {
+    const file = path.join(directory, `${label}.json`);
+    await writeFile(file, JSON.stringify({ ...manifest, files }));
+    await assert.rejects(prepareSourceImport(file), /聊天记录、角色两个不同/);
+  }
+});

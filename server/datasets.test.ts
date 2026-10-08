@@ -181,7 +181,9 @@ test('a checksum mismatch cannot publish a ready source version', async () => {
 test('frozen samples retain the original version after another import reuses all source IDs', async () => {
   const first = await importReady(fixture('第一版'), '原始 V1');
   const firstPreview = await preview(first.dataset.id);
-  assert.equal(firstPreview.items[0].dynamic_input_snapshot.context_window_start_turn, 7);
+  assert.equal(firstPreview.items[0].source_session_id, SESSION_ID);
+  assert.equal(firstPreview.items[0].dynamic_input_snapshot.context_window_start_turn, undefined);
+  assert.equal(firstPreview.session_rule,undefined);
   const idempotencyKey = randomUUID();
   const [sample, retry] = await Promise.all([
     sampleFromPreview(firstPreview, idempotencyKey),
@@ -216,6 +218,70 @@ test('accepted source_* and original_* CSV columns also work with the default SQ
   assert.equal(result.items[0].source_user_id, USER_ID);
   assert.equal(result.items[0].original_model, 'test-model');
   assert.equal(result.items[0].original_assistant_reply, '别名列 回复');
+});
+
+test('mixed table versions control SQL, restored snapshots and frozen lineage together', async () => {
+  const first = await importReady(fixture('聊天版'), '聊天来源');
+  const third = await importReady(fixture('角色版'), '角色来源');
+  const selection = {history:first.dataset.id,characters:third.dataset.id};
+  const request = {source_versions:selection,sql:DEFAULT_SAMPLE_SQL.replace('ORDER BY h.created_at DESC', "AND c.name = :name ORDER BY h.created_at DESC"),parameters:{min_turn:1,name:'角色版 角色'},sample_limit:10};
+  const result:any = await sampleOperation('createBatchLabPreview',request);
+  assert.equal(result.items[0].user_input,'聊天版 输入');
+  assert.equal(result.items[0].source_session_id,SESSION_ID);
+  assert.equal(result.items[0].character_snapshot.system_prompt,'角色版 角色提示词');
+  assert.equal(result.dataset_version_id,undefined);
+  assert.deepEqual(Object.fromEntries(Object.entries(result.source_versions).map(([kind,value]:[string,any])=>[kind,value.dataset_version_id])),selection);
+  const sample = await sampleFromPreview(result);
+  assert.deepEqual(sample.source_versions,result.source_versions);
+  assert.deepEqual(sample.session_rule,result.session_rule);
+  assert.equal(sample.dataset_version_id,undefined);
+  await importReady(fixture('后续新版本'));
+  const page:any = await sampleOperation('listBatchLabSampleSetSamples',{sampleSetId:sample.id});
+  assert.deepEqual(page.items,result.items);
+  const detail:any = await sampleOperation('getBatchLabSampleSet',{sampleSetId:sample.id});
+  assert.deepEqual(detail.source_versions,result.source_versions);
+  await assert.rejects(()=>sampleOperation('createBatchLabPreview',{...request,source_versions:{...selection,characters:first.dataset.id}}),/没有选出有效样本/);
+  await assert.rejects(()=>sampleOperation('createBatchLabPreview',{...request,source_versions:{history:first.dataset.id}}));
+  await assert.rejects(()=>sampleOperation('createBatchLabPreview',{...request,dataset_version_id:first.dataset.id}),/冲突/);
+  const same:any = await preview(first.dataset.id);
+  assert.equal(same.source_versions.characters.dataset_version_id,first.dataset.id);
+  const alternate:any = await sampleOperation('createBatchLabPreview',{source_versions:selection,sql:DEFAULT_SAMPLE_SQL,parameters:{min_turn:1},sample_limit:50});
+  assert.notEqual(alternate.digest,same.digest);
+});
+
+test('two-file imports freeze original prompt context without chat_sessions or invented session IDs', async () => {
+  const contents=fixture('两表');
+  const base=parseSourceCsv(contents.history.toString('utf8'),'history')[0];
+  delete base.session_id;
+  const nextId='88888888-8888-4888-8888-888888888888';
+  const thirdId='99999999-9999-4999-8999-999999999999';
+  const originalHistory=JSON.stringify([{role:'system',content:'保留跨会话的原始上下文'},{role:'user',content:'历史原文'}]);
+  contents.history=Buffer.from(Papa.unparse([
+    {...base,id:HISTORY_ID,created_at:'2026-09-24T00:00:00Z',turn_index:'10'},
+    {...base,id:nextId,created_at:'2026-09-24T00:29:59Z',turn_index:'41',history:originalHistory},
+    {...base,id:thirdId,created_at:'2026-09-24T00:59:59Z',turn_index:'42',history:originalHistory},
+  ]));
+  const imported:any=await datasetOperation('beginDatasetImport',{name:'只导入聊天和角色',idempotency_key:randomUUID(),files:manifest(contents).filter(file=>file.kind!=='sessions')});
+  for(const kind of ['history','characters'] as const)await uploadKind(imported.id,kind,contents[kind]);
+  const finished:any=await datasetOperation('finishDatasetImport',{datasetId:imported.id});
+  assert.equal(finished.dataset.session_count,0);
+  assert.equal(finished.previewable_history_count,3);
+  const request={source_versions:{history:imported.id,characters:imported.id},sql:'SELECT h.id AS source_history_id FROM experience.chat_history h WHERE h.turn_index > 40 ORDER BY h.created_at',parameters:{},sample_limit:50};
+  const result:any=await sampleOperation('createBatchLabPreview',request);
+  assert.equal(result.statistics.session_count,0);
+  assert.deepEqual(result.items.map((item:any)=>[item.source_history_id,item.source_session_id,item.turn_index]),[[nextId,null,41],[thirdId,null,42]]);
+  for(const item of result.items){
+    assert.deepEqual(item.history,JSON.parse(originalHistory));
+    assert.equal(item.dynamic_input_snapshot.derived_turn_index,undefined);
+    assert.equal(item.dynamic_input_snapshot.context_window_start_turn,undefined);
+  }
+  assert.deepEqual(Object.keys(result.source_versions),['history','characters']);
+  const sample=await sampleFromPreview(result);
+  assert.equal(sample.session_rule,undefined);
+  await importReady(fixture('后来重新导入'));
+  const frozen:any=await sampleOperation('listBatchLabSampleSetSamples',{sampleSetId:sample.id});
+  assert.deepEqual(frozen.items,result.items);
+  await assert.rejects(()=>sampleOperation('createBatchLabPreview',{...request,source_versions:{...request.source_versions,sessions:imported.id}}));
 });
 
 test('more than 8 MB of selected snapshots are all frozen and remain available through bounded pages', async () => {

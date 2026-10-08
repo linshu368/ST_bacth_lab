@@ -3,17 +3,16 @@ import { z } from 'zod';
 import { query, transaction } from './db.js';
 import { requireDataset } from './datasets.js';
 import { compileDatasetQuery } from './sql.js';
-import { batchLabPreviewItemSchema, type BatchLabPreviewItem } from '../src/lib/batch-lab-contracts.js';
+import { attachTurnModels, turnModelIndex } from './turn-models.js';
+import { batchLabPreviewItemSchema, batchLabSourceVersionSelectionSchema, type BatchLabPreviewItem, type BatchLabSourceVersions } from '../src/lib/batch-lab-contracts.js';
 
 export const DEFAULT_SAMPLE_SQL = `SELECT h.id AS source_history_id
 FROM experience.chat_history AS h
-JOIN experience.chat_sessions AS s ON s.id = h.session_id
 JOIN app_core.characters AS c ON c.id = h.character_id
 WHERE h.user_input IS NOT NULL
   AND h.model IS NOT NULL
   AND h.turn_index >= :min_turn
   AND h.revision >= 0
-  AND s.deleted_at IS NULL
 ORDER BY h.created_at DESC`;
 
 export function sourceSnapshot(row: any, ordinal: number): BatchLabPreviewItem {
@@ -21,14 +20,14 @@ export function sourceSnapshot(row: any, ordinal: number): BatchLabPreviewItem {
   let history: unknown;
   try { history = JSON.parse(h.history || '[]'); } catch { throw new Error('聊天记录的 history 不是有效 JSON'); }
   return batchLabPreviewItemSchema.parse({
-    ordinal, source_history_id:h.id, source_session_id:h.session_id || h.source_session_id,
+    ordinal, source_history_id:h.id, source_session_id:h.session_id || h.source_session_id || null,
     source_user_id:h.user_id || h.source_user_id,
     source_character_id:h.character_id || h.source_character_id,
     turn_index:Number(h.turn_index || 1),revision:Number(h.revision || 0),
     user_input:h.user_input,original_assistant_reply:h.assistant_reply || h.original_assistant_reply || null,
     original_model:h.model || h.original_model || 'unknown',history,
     character_snapshot:row.character_row,
-    dynamic_input_snapshot:{context_window_start_turn:Number(row.session_row?.context_window_start_turn || 1),source_status:h.status || 'unknown'},
+    dynamic_input_snapshot:{source_status:h.status || 'unknown'},
     restoration_strategy:'exact_prompt_snapshot',
   });
 }
@@ -49,7 +48,7 @@ export async function samplePage(sampleSetId:string, input:{cursor?:string|null;
 }
 
 export async function sampleOperation(op:string,input:any):Promise<unknown> {
-  if (op === 'listBatchLabSqlTemplates') return [{key:'recent_chat_history',version:1,name:'最近有效对话样本',description:'在选定的原始数据版本内执行只读 SELECT，必须返回 source_history_id。',sql:DEFAULT_SAMPLE_SQL,default_parameters:{min_turn:1},enabled:true}];
+  if (op === 'listBatchLabSqlTemplates') return [{key:'recent_chat_history',version:2,name:'最近有效对话样本',description:'聊天记录和角色分别使用选定版本，执行只读 SELECT，返回 source_history_id。',sql:DEFAULT_SAMPLE_SQL,default_parameters:{min_turn:1},enabled:true}];
   if (op === 'listBatchLabSampleSets') return (await query("SELECT data FROM lab_records WHERE kind='sample_set' AND coalesce(data->>'deleted_at','')='' ORDER BY created_at DESC")).map(r=>r.data);
   if (op === 'getBatchLabSampleSet') {
     const [row] = await query("SELECT data FROM lab_records WHERE kind='sample_set' AND id=$1",[z.string().uuid().parse(input.sampleSetId)]);
@@ -58,9 +57,23 @@ export async function sampleOperation(op:string,input:any):Promise<unknown> {
   }
   if (op === 'listBatchLabSampleSetSamples') return samplePage(input.sampleSetId,input.input);
   if (op === 'createBatchLabPreview') {
-    const value = z.object({dataset_version_id:z.string().uuid(),sql:z.string().trim().min(1).max(20_000),parameters:z.record(z.union([z.string().max(1000),z.number().finite(),z.boolean(),z.null()])),sample_limit:z.number().int().min(1).max(500)}).parse(input);
-    const dataset = await requireDataset(value.dataset_version_id);
-    const compiled = compileDatasetQuery({datasetId:dataset.id,sql:value.sql,parameters:value.parameters,sampleLimit:value.sample_limit});
+    const value = z.object({require_turn_models:z.boolean().optional(),min_message_turns:z.number().int().min(1).optional(),dataset_version_id:z.string().uuid().optional(),source_versions:batchLabSourceVersionSelectionSchema.optional(),sql:z.string().trim().min(1).max(20_000),parameters:z.record(z.union([z.string().max(1000),z.number().finite(),z.boolean(),z.null()])),sample_limit:z.number().int().min(1).max(500)}).parse(input);
+    if (!value.source_versions && !value.dataset_version_id) throw new Error('请先选择聊天记录和角色的原始数据版本');
+    const selection = batchLabSourceVersionSelectionSchema.parse(value.source_versions ?? {
+      history:value.dataset_version_id,characters:value.dataset_version_id,
+    });
+    if(value.dataset_version_id && Object.values(selection).some(id=>id!==value.dataset_version_id)) throw new Error('两张表的版本选择与旧版单版本参数冲突');
+    const datasets = await Promise.all([...new Set(Object.values(selection))].map(id=>requireDataset(id)));
+    const byDatasetId = new Map(datasets.map(dataset=>[dataset.id,dataset]));
+    const countKeys = {history:'history_count',characters:'character_count'} as const;
+    const sources = Object.fromEntries(Object.entries(selection).map(([kind,id])=>{
+      const dataset=byDatasetId.get(id)!;
+      return [kind,{dataset_version_id:id,dataset_version_number:Number(dataset.version),dataset_version_name:dataset.name,row_count:Number(dataset.counts[countKeys[kind as keyof typeof countKeys]] ?? 0)}];
+    })) as BatchLabSourceVersions;
+    const legacySource = datasets.length===1 ? {
+      dataset_version_id:datasets[0].id,dataset_version_number:Number(datasets[0].version),dataset_version_name:datasets[0].name,
+    } : {};
+    const compiled = compileDatasetQuery({datasetIds:selection,sql:value.sql,parameters:value.parameters,sampleLimit:value.sample_limit});
     const [, , result] = await transaction([
       {text:"SELECT set_config('statement_timeout','8000',true)"},
       {text:"SELECT set_config('lock_timeout','2000',true)"},
@@ -70,31 +83,42 @@ export async function sampleOperation(op:string,input:any):Promise<unknown> {
     if (ids.some(id=>!id)) throw new Error('SQL 必须返回 source_history_id 列');
     const id = randomUUID();
     const items: BatchLabPreviewItem[] = [];
+    const modelRows = value.require_turn_models ? await query(`SELECT jsonb_build_object(
+      'id',row_id,'session_id',data->'session_id','user_id',data->'user_id','character_id',data->'character_id',
+      'turn_index',data->'turn_index','model',data->'model','llm_model',data->'llm_model',
+      'user_input',data->'user_input','assistant_reply',data->'assistant_reply') AS data
+      FROM lab_source_rows WHERE dataset_id=$1 AND kind='history'`,[selection.history]) : [];
+    const models = turnModelIndex(modelRows.map(row=>row.data));
     const excluded:Record<string,number>={};
     for (let start=0;start<ids.length;start+=5) {
       const batch=ids.slice(start,start+5);
-      const rows=await query(`SELECT h.row_id,h.data AS history_row,s.data AS session_row,c.data AS character_row
+      const rows=await query(`SELECT h.row_id,h.data AS history_row,c.data AS character_row
         FROM lab_source_rows h
-        JOIN lab_source_rows s ON s.dataset_id=h.dataset_id AND s.kind='sessions' AND s.row_id=coalesce(nullif(h.data->>'session_id',''),h.data->>'source_session_id')
-        JOIN lab_source_rows c ON c.dataset_id=h.dataset_id AND c.kind='characters' AND c.row_id=coalesce(nullif(h.data->>'character_id',''),h.data->>'source_character_id')
-        WHERE h.dataset_id=$1 AND h.kind='history' AND h.row_id=ANY($2::text[])`,[dataset.id,batch]);
+        LEFT JOIN lab_source_rows c ON c.dataset_id=$3 AND c.kind='characters' AND c.row_id=coalesce(nullif(h.data->>'character_id',''),h.data->>'source_character_id')
+        WHERE h.dataset_id=$1 AND h.kind='history' AND h.row_id=ANY($2::text[])`,[selection.history,batch,selection.characters]);
       const byId=new Map(rows.map(r=>[r.row_id,r]));
       for (const anchor of batch) {
         const row=byId.get(anchor);
         if(!row){excluded.missing_history=(excluded.missing_history??0)+1;continue;}
+        if(!row.character_row){excluded.missing_character=(excluded.missing_character??0)+1;continue;}
         try {
-          const item=sourceSnapshot(row,items.length);
+          let item=sourceSnapshot(row,items.length);
+          if(value.min_message_turns && item.history.filter(message=>message.role==='user').length<value.min_message_turns){excluded.insufficient_message_turns=(excluded.insufficient_message_turns??0)+1;continue;}
+          if(value.require_turn_models) {
+            try { item=attachTurnModels(item,models); }
+            catch { excluded.missing_turn_models=(excluded.missing_turn_models??0)+1;continue; }
+          }
           const bytes=Buffer.byteLength(JSON.stringify(item));
           if(bytes>2_000_000){excluded.snapshot_too_large=(excluded.snapshot_too_large??0)+1;continue;}
           items.push(item);
         } catch { excluded.invalid_anchor=(excluded.invalid_anchor??0)+1; }
       }
     }
-    if(!items.length) throw new Error('SQL 没有选出有效样本，请检查查询条件及关联数据');
-    const digest='sha256:'+createHash('sha256').update(JSON.stringify({dataset:dataset.id,sql:value.sql,parameters:value.parameters,items:items.map(i=>i.source_history_id)})).digest('hex');
-    const metadata={id,digest,source_environment:'test',dataset_version_id:dataset.id,dataset_version_number:Number(dataset.version),dataset_version_name:dataset.name,
+    if(!items.length) throw new Error('SQL 没有选出有效样本，请检查所选聊天记录和角色版本、查询条件及关联数据；缺少角色时不会从其他版本补齐');
+    const digest='sha256:'+createHash('sha256').update(JSON.stringify({source_versions:selection,sql:value.sql,parameters:value.parameters,items:items.map(i=>i.source_history_id)})).digest('hex');
+    const metadata={id,digest,source_environment:'test',...legacySource,source_versions:sources,
       final_sql:value.sql,parameters:value.parameters,sample_limit:value.sample_limit,
-      statistics:{requested_count:value.sample_limit,candidate_count:result.length,valid_count:items.length,user_count:new Set(items.map(i=>i.source_user_id)).size,session_count:new Set(items.map(i=>i.source_session_id)).size,character_count:new Set(items.map(i=>i.source_character_id)).size,excluded_by_reason:excluded,truncated:result.length>value.sample_limit,snapshot_bytes:Buffer.byteLength(JSON.stringify(items))},
+      statistics:{requested_count:value.sample_limit,candidate_count:result.length,valid_count:items.length,user_count:new Set(items.map(i=>i.source_user_id)).size,session_count:new Set(items.map(i=>i.source_session_id).filter(Boolean)).size,character_count:new Set(items.map(i=>i.source_character_id)).size,excluded_by_reason:excluded,truncated:result.length>value.sample_limit,snapshot_bytes:Buffer.byteLength(JSON.stringify(items))},
       created_at:new Date().toISOString(),expires_at:new Date(Date.now()+15*60_000).toISOString()};
     // Publish the preview only after every snapshot is stored. Bounded writes keep
     // transport limits separate from the total size of a saved sample version.
@@ -135,7 +159,7 @@ export async function sampleOperation(op:string,input:any):Promise<unknown> {
     if(Date.parse(preview.expires_at)<Date.now()) throw new Error('预览已过期，请重新执行 SQL');
     const id=randomUUID();
     const sample={id,name:value.name,source_environment:'test',source_preview_id:preview.id,source_digest:preview.digest,sample_count:preview.statistics.valid_count,
-      statistics:preview.statistics,frozen_sql:preview.final_sql,frozen_parameters:preview.parameters,dataset_version_id:preview.dataset_version_id,dataset_version_number:preview.dataset_version_number,dataset_version_name:preview.dataset_version_name,
+      statistics:preview.statistics,frozen_sql:preview.final_sql,frozen_parameters:preview.parameters,source_versions:preview.source_versions,dataset_version_id:preview.dataset_version_id,dataset_version_number:preview.dataset_version_number,dataset_version_name:preview.dataset_version_name,
       created_at:new Date().toISOString(),deleted_at:null,idempotency_key:value.idempotency_key};
     await transaction([
       {text:"INSERT INTO lab_records(kind,id,data) VALUES('sample_set',$1,$2::jsonb || jsonb_build_object('version',nextval('lab_sample_version_seq'))) ON CONFLICT DO NOTHING",values:[id,JSON.stringify(sample)]},
