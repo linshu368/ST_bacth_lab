@@ -5,10 +5,11 @@ import {randomUUID} from 'node:crypto';
 import {PGlite} from '@electric-sql/pglite';
 import {createEvaluationService} from './evaluations.js';
 import {evaluationContext,cleanBody,renderInput} from './evaluation-context.js';
-import {INPUT_TEMPLATE,evaluationResultSchema,DEFAULT_MAPPING,verdict,flattenJson,firstLevelComparison,singleOutputFormat,pairedOutputFormat,validatePairedResult,validateComparisonResult,validateDirectionalComparisonResult,DEFAULT_OUTPUT_FORMAT} from '../src/lib/evaluation.js';
+import {INPUT_TEMPLATE,evaluationResultSchema,DEFAULT_MAPPING,verdict,flattenJson,firstLevelComparison,singleOutputFormat,pairedOutputFormat,validatePairedResult,validateComparisonResult,validateDirectionalComparisonResult,DEFAULT_OUTPUT_FORMAT,EVALUATION_DIMENSIONS} from '../src/lib/evaluation.js';
 const db=new PGlite();const q=async<T=any>(sql:string,args:any[]=[])=> (await db.query<T>(sql,args)).rows;
 const tx=async(statements:Array<{text:string;values?:any[]}>)=>db.transaction(async c=>{const result:any[]=[];for(const s of statements)result.push((await c.query(s.text,s.values??[])).rows);return result;});
 before(async()=>db.exec(await readFile(new URL('./schema.sql',import.meta.url),'utf8')));after(()=>db.close());
+const scoredResult=(结论:'A'|'B'|'平局')=>({解释原因:{...Object.fromEntries(EVALUATION_DIMENSIONS.map(name=>[name,{A:结论==='B'?3:5,B:结论==='A'?3:5,说明:`${name}的具体证据和评分理由`}])) as Record<string,{A:number;B:number;说明:string}>,硬性问题:[],综合判断:结论==='平局'?'双方没有决定性差异':`${结论} 在关键维度上更好`},结论});
 function contextFixture(){
  const history=[];for(let i=1;i<=6;i++){history.push({role:'user',content:`USER${i}`});if(i<6)history.push({role:'assistant',content:`OLD${i}`});}
  const experiment={exclude_last_turn:true,run_mode:'multi_turn',comparison_variable:'instruction_prompt',variants:[
@@ -40,7 +41,7 @@ test('evaluation freezes inputs, preserves manual votes, supports retry and isol
  await q('INSERT INTO lab_snapshots(sample_set_id,ordinal,data) VALUES($1,0,$2)',[set,JSON.stringify(f.stored)]);
  for(const a of f.attempts)await q('INSERT INTO lab_attempts(id,experiment_id,sample_set_id,sample_ordinal,variant_key,turn_index,status,attempt_count,data) VALUES($1,$2,$3,0,$4,$5,$6,1,$7)',[a.id,experimentId,set,a.variant_key,a.turn_index,a.status,JSON.stringify(a.data)]);
  await q('INSERT INTO lab_annotations VALUES($1,0,1,$2)',[experimentId,JSON.stringify({tag:'preference:b'})]);
- let calls=0;let invalid=true;let responseResult:any={解释原因:'A 准确承接用户行动，B 遗漏关键要求。',结论:'A'};let lastMessages:any;
+ let calls=0;let invalid=true;let responseResult:any=scoredResult('A');let lastMessages:any;
  const operation=createEvaluationService({query:q,transaction:tx,env:{BATCH_LAB_MODEL_KEY:'test'},fetcher:async(_url,init)=>{calls++;assert.equal(new Headers(init?.headers).get('Authorization'),calls===1?'Bearer custom-evaluation-key':'Bearer test');const body=JSON.parse(String(init?.body));lastMessages=body.messages;assert.equal(body.model,'judge/model');assert.doesNotMatch(body.messages[1].content,/USER6|角色与世界设定|数据有效性信息/);assert.match(body.messages[1].content,/输出格式以以下 JSON 示例为准/);assert.doesNotMatch(body.messages[0].content,/本次手动标准/);return Response.json({model:'judge/model',choices:[{message:{content:invalid?'not json':JSON.stringify(responseResult)},finish_reason:'stop'}]});}});
  const input={experiment_id:experimentId,name:'评估',model:'judge/model',base_url:'https://openrouter.ai/api/v1',input_template_id:'builtin-input-v1',criteria_template_id:'builtin-criteria-v3',criteria_content:'本次手动标准：只比较是否准确承接用户动作。',near_turns:1,concurrency:1,idempotency_key:randomUUID()};
  const job=await operation('evaluationCreate',input);assert.equal(calls,0);assert.equal((await operation('evaluationCreate',input)).id,job.id);
@@ -64,7 +65,7 @@ test('evaluation freezes inputs, preserves manual votes, supports retry and isol
  invalid=false;await operation('evaluationRetry',{job_id:job.id});await Promise.all([operation('evaluationRun',{job_id:job.id}),operation('evaluationRun',{job_id:job.id})]);
  const final=await operation('evaluationDetail',{job_id:job.id});assert.equal(final.summary.A,2);assert.equal(final.job.status,'completed');assert.equal(calls,3);
  const savedSets=await operation('evaluationResultList');const saved=savedSets.find((item:any)=>item.id===job.id);assert.equal(saved.summary.A,2);assert.equal(saved.summary.total,2);
- responseResult={解释原因:'B 准确落实要求，A 遗漏一个关键动作。',结论:'B'};
+ responseResult=scoredResult('B');
  const custom=await operation('evaluationCreate',{...input,output_format:JSON.stringify({质量:0,解释:'说明'}),idempotency_key:randomUUID()});
  assert.equal(custom.output_format,DEFAULT_OUTPUT_FORMAT);
  await operation('evaluationRun',{job_id:custom.id});const customDetail=await operation('evaluationDetail',{job_id:custom.id});assert.equal(customDetail.summary.B,1);assert.deepEqual(customDetail.items.find((i:any)=>i.status==='completed').result,responseResult);
@@ -93,11 +94,13 @@ test('define one output dictionary and enforce identical A and B keys',()=>{
 test('fixed comparison output contains explanation first and a constrained conclusion',()=>{
  assert.deepEqual(Object.keys(JSON.parse(DEFAULT_OUTPUT_FORMAT)),['解释原因','结论']);
  assert.equal(JSON.parse(DEFAULT_OUTPUT_FORMAT).结论,'A');
- assert.doesNotThrow(()=>validateComparisonResult({解释原因:'A 更准确地回应了用户的动作。',结论:'A'}));
- assert.doesNotThrow(()=>validateComparisonResult({解释原因:'两边没有足够明显的差异。',结论:'平局'}));
- assert.throws(()=>validateComparisonResult({结论:'A',解释原因:'理由'}),/先写/);
- assert.throws(()=>validateComparisonResult({解释原因:'理由',结论:'左边'}),/A.*B.*平局/);
- assert.throws(()=>validateComparisonResult({解释原因:'理由',结论:'B',评分:8}),/两个字段/);
+ assert.doesNotThrow(()=>validateComparisonResult(scoredResult('A')));
+ assert.doesNotThrow(()=>validateComparisonResult(scoredResult('平局')));
+ assert.doesNotThrow(()=>validateComparisonResult({解释原因:'旧格式理由',结论:'A'},JSON.stringify({解释原因:'文字',结论:'A'})));
+ assert.throws(()=>validateComparisonResult({结论:'A',解释原因:scoredResult('A').解释原因}),/先写/);
+ assert.throws(()=>validateComparisonResult({解释原因:'理由',结论:'左边'}),/六维评分/);
+ assert.throws(()=>validateComparisonResult({...scoredResult('B'),评分:8}),/两个字段/);
+ const invalidScore=scoredResult('A');invalidScore.解释原因.意图响应.A=6;assert.throws(()=>validateComparisonResult(invalidScore),/1~5/);
  assert.equal(verdict({解释原因:'理由',结论:'B'}),'B');
  assert.doesNotThrow(()=>validateDirectionalComparisonResult({解释原因:'旧记录理由',结论:'左边'}));
 });

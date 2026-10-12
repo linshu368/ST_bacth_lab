@@ -15,7 +15,7 @@ import {
 } from '../src/lib/batch-lab-contracts.js';
 import { query, transaction } from './db.js';
 import { digest, operationId, serviceError } from './processors.js';
-import { pureUserInput, withInstructionPrompt } from '../src/lib/instruction-prompt.js';
+import { fillInstructionSlots, INSTRUCTION_SLOT_NAMES, pureUserInput, withInstructionPrompt } from '../src/lib/instruction-prompt.js';
 import { excludeLastTurn } from '../src/lib/replay-sample.js';
 import { COMPARISON_SUMMARY_SQL, comparisonSummary } from './comparison-summary.js';
 
@@ -170,14 +170,16 @@ function replayTranscript(history: Message[], input: string, turns: number) {
   return { messages, users: users.slice(-turns) };
 }
 
-export function buildAttemptMessages(history: Message[], previous: string[], input: string, preset?: Partial<BatchLabOutputPreset> | null, turns = 1): Message[] {
+export function buildAttemptMessages(history: Message[], previous: string[], input: string, preset?: Partial<BatchLabOutputPreset> | null, turns = 1, preserveSourceSlots = false, sourceTemplate?: string): Message[] {
   const replay = replayTranscript(history, input, turns);
   if (previous.length >= turns) throw serviceError('BATCH_LAB_EXPERIMENT_VALIDATION_ERROR', '重跑轮次超出范围');
   const messages: Message[] = [
     ...replay.messages.slice(0, replay.users[0]),
   ];
   for (let turn = 0; turn <= previous.length; turn++) {
-    messages.push({ role: 'user', content: withInstructionPrompt(replay.messages[replay.users[turn]].content, preset?.content) });
+    const sourceContent = history[replay.users[turn]]?.content ?? input;
+    const instruction = preserveSourceSlots && preset?.content ? fillInstructionSlots(preset.content, sourceContent, sourceTemplate) : preset?.content;
+    messages.push({ role: 'user', content: withInstructionPrompt(replay.messages[replay.users[turn]].content, instruction) });
     if (turn < previous.length) {
       messages.push({ role: 'assistant', content: previous[turn] });
       messages.push(...replay.messages.slice(replay.users[turn] + 1, replay.users[turn + 1]).filter(message => message.role === 'system'));
@@ -274,6 +276,14 @@ export function createExperimentService(dependencies: ExperimentDependencies) {
     if (parsed.comparison_variable === 'model' && !parsed.output_preset?.content?.trim()) {
       throw serviceError('BATCH_LAB_EXPERIMENT_VALIDATION_ERROR', '模型对比需要手动填写两组共用的 Instruction prompt');
     }
+    if (parsed.instruction_slot_mode === 'preserve_source') {
+      if (parsed.comparison_variable !== 'instruction_prompt') throw serviceError('BATCH_LAB_EXPERIMENT_VALIDATION_ERROR', '槽位继承仅用于 Instruction prompt 对比');
+      for (const variant of parsed.variants) {
+        const content = variant.output_preset?.content ?? '';
+        const missing = INSTRUCTION_SLOT_NAMES.filter(name => !content.includes(`{{${name}}}`));
+        if (missing.length) throw serviceError('BATCH_LAB_EXPERIMENT_VALIDATION_ERROR', `${variant.name} 的 Instruction prompt 缺少槽位：${missing.map(name => `{{${name}}}`).join('、')}`);
+      }
+    }
     if (parsed.comparison_variable) {
       const sharedProvider = parsed.variants.find(variant => variant.provider_config)?.provider_config;
       parsed.variants = parsed.variants.map(variant => ({ ...variant, sampling: {},
@@ -303,7 +313,7 @@ export function createExperimentService(dependencies: ExperimentDependencies) {
       source_environment: sampleSet.source_environment ?? 'test', status: 'draft', purpose: parsed.purpose ?? null,
       concurrency: parsed.concurrency ?? DEFAULT_CONCURRENCY,
       sample_limit: parsed.sample_limit, selected_sample_ordinals: selectedSampleOrdinals,
-      comparison_variable: parsed.comparison_variable,
+      comparison_variable: parsed.comparison_variable, instruction_slot_mode: parsed.instruction_slot_mode,
       run_mode: parsed.run_mode ?? 'single', output_preset: parsed.output_preset, provider_config: parsed.provider_config,
       exclude_last_turn: parsed.exclude_last_turn ?? true,
       variants: parsed.variants, total_attempts: 0, completed_attempts: 0, failed_attempts: 0,
@@ -342,7 +352,15 @@ export function createExperimentService(dependencies: ExperimentDependencies) {
           throw serviceError('BATCH_LAB_EXPERIMENT_VALIDATION_ERROR', `样本 #${sample.ordinal} 缺少原始模型名称`);
         }
         if (experiment.exclude_last_turn) sample.data = excludeLastTurn(sample.data);
-        try { replayTranscript(sample.data.history ?? [], sample.data.user_input, turns); }
+        try {
+          const replay = replayTranscript(sample.data.history ?? [], sample.data.user_input, turns);
+          if (experiment.instruction_slot_mode === 'preserve_source') {
+            const sourceTemplate = experiment.variants[0]?.output_preset?.content ?? '';
+            for (const variant of experiment.variants.filter((item: Row) => item.generation_mode !== 'original')) {
+              for (const userIndex of replay.users) fillInstructionSlots(variant.output_preset?.content ?? '', sample.data.history?.[userIndex]?.content ?? sample.data.user_input, sourceTemplate);
+            }
+          }
+        }
         catch (error: any) { throw serviceError('BATCH_LAB_EXPERIMENT_VALIDATION_ERROR', `样本 #${sample.ordinal}：${error.message}`); }
         for (const variant of originals) {
           const count = experiment.run_mode === 'multi_turn' ? variant.max_turns : 1;
@@ -497,7 +515,8 @@ export function createExperimentService(dependencies: ExperimentDependencies) {
       const turns = experiment.run_mode === 'multi_turn' ? variant.max_turns : 1;
       if (previous.length !== attempt.turn_index - 1) throw serviceError('BATCH_LAB_EXPERIMENT_VALIDATION_ERROR', '前序轮次尚未完成');
       const preset = experiment.comparison_variable === 'model' ? experiment.output_preset : variant.output_preset ?? experiment.output_preset;
-      const messages = buildAttemptMessages(sample.history ?? [], previous.map(row => row.output), sample.user_input, preset, turns);
+      const sourceTemplate = experiment.instruction_slot_mode === 'preserve_source' ? experiment.variants[0]?.output_preset?.content : undefined;
+      const messages = buildAttemptMessages(sample.history ?? [], previous.map(row => row.output), sample.user_input, preset, turns, experiment.instruction_slot_mode === 'preserve_source', sourceTemplate);
       const replay = replayTranscript(sample.history ?? [], sample.user_input, turns);
       const log = { input_messages: messages, replay_user_input: replay.messages[replay.users[attempt.turn_index - 1]].content, request_model: variant.provider_config?.module_name || experiment.provider_config?.module_name || variant.openrouter_model_id,
         request_sampling: variant.sampling, request_base_url: variant.provider_config?.base_url || experiment.provider_config?.base_url || env.BATCH_LAB_MODEL_BASE_URL || 'https://openrouter.ai/api/v1/chat/completions' };
@@ -608,7 +627,7 @@ export function createExperimentService(dependencies: ExperimentDependencies) {
         const parsed = batchLabCopyExperimentRequestSchema.strip().parse(input);
         const source = await record('experiment', parsed.source_experiment_id);
         const variants = source.variants;
-        return create({ ...parsed, variants, sample_set_id: source.sample_set_id, run_mode: source.run_mode, concurrency: source.concurrency, sample_limit: source.sample_limit, comparison_variable: source.comparison_variable,
+        return create({ ...parsed, variants, sample_set_id: source.sample_set_id, run_mode: source.run_mode, concurrency: source.concurrency, sample_limit: source.sample_limit, comparison_variable: source.comparison_variable, instruction_slot_mode: source.instruction_slot_mode,
           output_preset: source.output_preset, provider_config: source.provider_config }, op,
         { kind: 'generation', source_experiment_id: source.id, generation_source_experiment_id: null });
       }

@@ -88,6 +88,7 @@ import {
   parseSqlParameters,
   variantDiffRows,
 } from './lib/workbench';
+import { INSTRUCTION_SLOT_NAMES } from './lib/instruction-prompt';
 
 const { Header, Content } = Layout;
 
@@ -197,6 +198,7 @@ function makeVariant(
     key, name: variant.name, generation_mode: 'original', model_id: 'original', openrouter_model_id: 'original',
     tier: null, is_free: true, sampling: {}, processor_version_id: null,
     max_turns: values.run_mode === 'single' ? 1 : values.max_turns,
+    output_preset: { name: `${variant.name} 线上 Instruction prompt 模板`, content: variant.output_preset_content, format: '' },
   };
   const modelSource = values.comparison_variable === 'instruction_prompt' ? 'sample' : variant.model_source;
   const modelName = modelSource === 'sample' ? 'sample-original-model' : variant.openrouter_model_id.trim();
@@ -1659,6 +1661,7 @@ function ExperimentWizard({
         concurrency: values.concurrency,
         sample_limit: values.sample_scope === 'random' ? values.sample_limit : undefined,
         comparison_variable: values.comparison_variable,
+        instruction_slot_mode: values.comparison_variable === 'instruction_prompt' ? 'preserve_source' : undefined,
         output_preset: values.comparison_variable === 'model' ? { name: '两组共用 Instruction prompt', content: values.shared_instruction_prompt, format: '' } : undefined,
         variants: [makeVariant(values, 0, 'a'), makeVariant(values, 1, 'b')],
         idempotency_key: newIdempotencyKey(),
@@ -1714,8 +1717,7 @@ function ExperimentWizard({
         model_source: 'sample',
         provider_base_url: DEFAULT_OPENROUTER_BASE_URL,
         openrouter_model_id: DEFAULT_EXPERIMENT_OPENROUTER_MODEL_ID,
-        output_preset_content:
-          '保持角色一致，自然回应用户，推进对话。',
+        output_preset_content: '',
       },
       {
         name: '候选 B',
@@ -1723,8 +1725,7 @@ function ExperimentWizard({
         model_source: 'custom',
         provider_base_url: DEFAULT_OPENROUTER_BASE_URL,
         openrouter_model_id: DEFAULT_EXPERIMENT_OPENROUTER_MODEL_ID,
-        output_preset_content:
-          '保持角色一致，自然回应用户，推进对话。\n减少重复的动作和情绪描写；用户要求安静时，不主动追问。',
+        output_preset_content: '',
       },
     ],
   };
@@ -1826,8 +1827,20 @@ function ExperimentWizard({
                 {comparisonVariable === 'instruction_prompt' ? <Form.Item name={['variants', index, 'generation_mode']} label="回复来源" rules={[{ required: true }]}>
                   <Select options={[{ value: 'original', label: '固定 · 使用原始线上回复（不调用模型）' }, { value: 'generate', label: '重新生成 · 调用模型' }]} />
                 </Form.Item> : null}
-                {(comparisonVariable === 'instruction_prompt' && (variantValues?.[index]?.generation_mode ?? initialValues.variants[index].generation_mode)) === 'original' ? (
-                  <Alert type="info" message="直接对照样本中保存的原始线上回复。连续模式逐轮取对应回复，保持原样。" />
+                {(comparisonVariable === 'instruction_prompt' && (variantValues?.[index]?.generation_mode ?? initialValues.variants[index].generation_mode)) === 'original' ? (<>
+                  <Alert type="info" message="回复继续使用样本中保存的原始线上结果；下面的模板只用于从每个案例的原始指令中提取槽位值，不会调用模型。" />
+                  <Form.Item
+                    name={['variants', index, 'output_preset_content']}
+                    label="线上 Roleplay System Instructions 模板"
+                    extra="粘贴线上模板并保留 {{INTERACTION_MODE}}、{{USER_CUSTOM_INSTRUCTIONS}}、{{WORD_COUNT}}。系统会用这份模板逐案例解析组合 A 的实际槽位值。"
+                    rules={[{ required: true }, { validator: async (_, value) => {
+                      const missing = INSTRUCTION_SLOT_NAMES.filter(name => !String(value ?? '').includes(`{{${name}}}`));
+                      if (missing.length) throw new Error(`缺少槽位：${missing.map(name => `{{${name}}}`).join('、')}`);
+                    } }]}
+                  >
+                    <Input.TextArea rows={10} maxLength={10_000} placeholder="粘贴线上 Roleplay System Instructions 模板" />
+                  </Form.Item>
+                </>
                 ) : <>
                 {comparisonVariable === 'model' ? <>
                   <Form.Item name={['variants', index, 'model_source']} label="模型来源" rules={[{ required: true }]}>
@@ -1842,10 +1855,13 @@ function ExperimentWizard({
                 <Form.Item
                   name={['variants', index, 'output_preset_content']}
                   label="Instruction prompt · 每轮用户输入前的指令"
-                  extra="填写完整指令。先清除历史用户消息中的旧指令，再为需要重跑的轮次拼接本组指令；可包含末尾的 ##用户指令:。"
-                  rules={[{ required: true }]}
+                  extra="填写完整指令，并保留 {{INTERACTION_MODE}}、{{USER_CUSTOM_INSTRUCTIONS}}、{{WORD_COUNT}} 三个槽位。运行时会从组合 A 对应轮次的原始指令中提取实际值并自动填入。"
+                  rules={[{ required: true }, { validator: async (_, value) => {
+                    const missing = INSTRUCTION_SLOT_NAMES.filter(name => !String(value ?? '').includes(`{{${name}}}`));
+                    if (missing.length) throw new Error(`缺少槽位：${missing.map(name => `{{${name}}}`).join('、')}`);
+                  } }]}
                 >
-                  <Input.TextArea rows={8} maxLength={10_000} />
+                  <Input.TextArea rows={10} maxLength={10_000} placeholder="粘贴候选 Roleplay System Instructions 模板" />
                 </Form.Item>
                 </>}
                 </>}
@@ -1910,6 +1926,7 @@ function ConfirmationModal({
             </Descriptions.Item>
             {sampleSet ? <Descriptions.Item label="版本链"><VersionLineage sampleSet={sampleSet} /></Descriptions.Item> : null}
             <Descriptions.Item label="对比变量">{values.comparison_variable === 'model' ? '模型（手动指令共用）' : 'Instruction prompt（样本模型固定）'}</Descriptions.Item>
+            {values.comparison_variable === 'instruction_prompt' ? <Descriptions.Item label="槽位控制">INTERACTION_MODE、USER_CUSTOM_INSTRUCTIONS、WORD_COUNT 自动继承组合 A</Descriptions.Item> : null}
             <Descriptions.Item label="运行模式">{values.run_mode === 'single' ? '单轮 · 只重跑最后一轮' : `连续 · 重跑最后 ${values.max_turns} 轮（用户输入不变）`}</Descriptions.Item>
             <Descriptions.Item label="样本范围">{values.sample_scope === 'random' ? `随机抽取 ${runSampleCount} 条用于调试` : `全部 ${runSampleCount} 条`}</Descriptions.Item>
             <Descriptions.Item label="并发请求数">{values.concurrency} 个 / 批</Descriptions.Item>

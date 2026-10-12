@@ -4,11 +4,13 @@ import {useEffect,useRef,useState} from 'react';
 import {useMutation,useQuery,useQueryClient} from '@tanstack/react-query';
 import {Alert,Button,Card,Collapse,Drawer,Form,Input,InputNumber,Modal,Select,Space,Statistic,Table,Tag,Typography,message} from 'antd';
 import {rpc,newIdempotencyKey} from '../api/client';
-import {INPUT_TEMPLATE,CRITERIA_TEMPLATE,DEFAULT_OUTPUT_FORMAT,verdict,type EvaluationTemplate,type EvaluationJob,type EvaluationItem,type EvaluationComparisonSnapshot} from '../lib/evaluation';
+import {INPUT_TEMPLATE,CRITERIA_TEMPLATE,DEFAULT_OUTPUT_FORMAT,EVALUATION_DIMENSIONS,verdict,type EvaluationTemplate,type EvaluationJob,type EvaluationItem,type EvaluationComparisonSnapshot} from '../lib/evaluation';
 type Detail={job:EvaluationJob;summary:Record<string,number>;items:EvaluationItem[]};
 type ResultSet=EvaluationJob&{summary:Record<string,number>};
 const itemConclusion=(item:EvaluationItem)=>item.result&&typeof item.result==='object'&&!Array.isArray(item.result)?String((item.result as Record<string,unknown>).结论??''):'';
-const itemReason=(item:EvaluationItem)=>item.result&&typeof item.result==='object'&&!Array.isArray(item.result)?String((item.result as Record<string,unknown>).解释原因??''):'';
+const itemExplanation=(item:EvaluationItem)=>item.result&&typeof item.result==='object'&&!Array.isArray(item.result)?(item.result as Record<string,unknown>).解释原因:undefined;
+const itemReason=(item:EvaluationItem)=>{const reason=itemExplanation(item);if(typeof reason==='string')return reason;if(!reason||typeof reason!=='object'||Array.isArray(reason))return '';const record=reason as Record<string,unknown>;const summary=typeof record.综合判断==='string'?record.综合判断:'';const dimensions=EVALUATION_DIMENSIONS.flatMap(name=>{const score=record[name];if(!score||typeof score!=='object'||Array.isArray(score))return [];const value=score as Record<string,unknown>;return [`${name} A ${value.A ?? '—'} / B ${value.B ?? '—'}：${String(value.说明??'')}`];});const issues=Array.isArray(record.硬性问题)&&record.硬性问题.length?`硬性问题：${record.硬性问题.join('；')}`:'';return [summary,...dimensions,issues].filter(Boolean).join('\n');};
+const itemReasonSummary=(item:EvaluationItem)=>{const reason=itemExplanation(item);if(reason&&typeof reason==='object'&&!Array.isArray(reason)&&typeof (reason as Record<string,unknown>).综合判断==='string')return String((reason as Record<string,unknown>).综合判断);return itemReason(item);};
 function comparisonFrom(job:EvaluationJob,experiment?:BatchLabExperimentSummary):EvaluationComparisonSnapshot|undefined{
  if(job.comparison)return job.comparison;if(!experiment)return undefined;
  return {variable:experiment.comparison_variable,shared_instruction_prompt:experiment.output_preset?.content,variants:experiment.variants.slice(0,2).map(variant=>({
@@ -43,7 +45,7 @@ function ReviewComparison({item,comparison,onNext,nextDisabled,position,total}:{
    <Card size="small" title={sideName(comparison,0)} extra={conclusion==='A'||conclusion==='左边'?<Tag color="blue">AI 选择</Tag>:null}>{body(review.reply_a)}</Card>
    <Card size="small" title={sideName(comparison,1)} extra={conclusion==='B'||conclusion==='右边'?<Tag color="purple">AI 选择</Tag>:null}>{body(review.reply_b)}</Card>
   </div>
-  {item.status==='completed'?<Alert type="info" message={<>AI 结论：<strong>{conclusion||'未识别'}</strong></>} description={<div style={{whiteSpace:'pre-wrap'}}>{itemReason(item)||'模型没有返回解释原因'}</div>}/>:null}
+  {item.status==='completed'?<JsonEvaluationView value={item.result}/>:null}
   <div style={{display:'flex',justifyContent:'flex-end',alignItems:'center',gap:12}}>
    <Typography.Text type="secondary">正在复核 {position} / {total}</Typography.Text>
    <Button type="primary" disabled={nextDisabled} onClick={onNext}>下一个</Button>
@@ -73,7 +75,7 @@ function EvaluationItemsTable({detail,comparison,onInspect,inspectLoading,inspec
   <Table size="small" rowKey="id" dataSource={filtered} pagination={{current:page,pageSize,onChange:setPage}} onRow={r=>({id:`evaluation-row-${r.id}`})} scroll={{x:1100}} expandable={{showExpandColumn:false,expandedRowKeys:expandedRows,rowExpandable:r=>!!r.review,onExpand:(open,r)=>setExpandedRows(open?[r.id]:[]),expandedRowRender:r=><ReviewComparison item={r} comparison={comparison} onNext={next} nextDisabled={currentIndex===reviewable.length-1} position={currentIndex+1} total={reviewable.length}/>}} columns={[
    {title:'样本',dataIndex:'sample_ordinal',render:n=>`#${n}`},{title:'轮次',render:(_,r)=>`对比 ${r.turn_index} / 原第 ${r.source_turn} 轮`},
    {title:'AI 结论',width:100,render:(_,r)=>{const conclusion=itemConclusion(r);return <Tag color={conclusion==='A'||conclusion==='左边'?'blue':conclusion==='B'||conclusion==='右边'?'purple':conclusion==='平局'?'default':undefined}>{r.status==='skipped'?'跳过':r.status==='completed'?(conclusion||'已评估'):({pending:'待评',running:'评估中',failed:'失败'}[r.status]??r.status)}</Tag>;}},
-   {title:'原因摘要',width:360,render:(_,r)=><Typography.Paragraph ellipsis={{rows:2}} style={{marginBottom:0}}>{itemReason(r)||'—'}</Typography.Paragraph>},
+   {title:'原因摘要',width:360,render:(_,r)=><Typography.Paragraph ellipsis={{rows:2}} style={{marginBottom:0}}>{itemReasonSummary(r)||'—'}</Typography.Paragraph>},
    {title:'状态说明',render:(_,r)=>r.skip_reason||r.error||'—'},
    {title:'操作',width:onInspect?210:100,render:(_,r)=><Space><Button size="small" disabled={!r.review} onClick={()=>expandedRows.includes(r.id)?setExpandedRows([]):openReview(r.id)}>{expandedRows.includes(r.id)?'收起对比':'直接对比'}</Button>{onInspect?<Button size="small" loading={inspectLoading&&inspectId===r.id} onClick={()=>onInspect(r.id)}>完整 Prompt</Button>:null}</Space>},
  ]}/>
@@ -148,7 +150,7 @@ export function AutomaticEvaluation({experiment}:{experiment:BatchLabExperimentS
     <Form.Item label="评估标准模板" name="criteria_template_id" rules={[{required:true}]}><Select onChange={id=>form.setFieldValue('criteria_content',templates.data?.find(t=>t.id===id)?.content??CRITERIA_TEMPLATE)} options={templates.data?.map(t=>({value:t.id,label:`${t.name} · ${t.version}`}))}/></Form.Item>
     <Form.Item label="评估标准 Prompt" name="criteria_content" extra="可以直接修改。本次保存后会冻结在评估计划中，不影响原模板。" rules={[{required:true,message:'请填写评估标准'}]}><Input.TextArea rows={18} maxLength={40000} showCount/></Form.Item>
     <Button onClick={edit}>将当前评估标准另存为共享模板</Button>
-    <Card size="small" title="固定输出格式 JSON" className="section-gap"><Typography.Paragraph type="secondary">模型先解释原因，再给出结论。结论只允许“A”“B”或“平局”，用于自动汇总比分。</Typography.Paragraph><pre style={{whiteSpace:'pre-wrap'}}>{DEFAULT_OUTPUT_FORMAT}</pre></Card>
+    <Card size="small" title="固定输出格式 JSON" className="section-gap"><Typography.Paragraph type="secondary">模型先按六个维度分别给 A、B 打 1~5 分并说明证据，再给出综合判断和结论。结论只允许“A”“B”或“平局”，用于自动汇总比分。</Typography.Paragraph><pre style={{whiteSpace:'pre-wrap'}}>{DEFAULT_OUTPUT_FORMAT}</pre></Card>
     <Typography.Paragraph type="secondary" className="section-gap">远场保留全部用户原话，省略角色回复；近场默认保留前 4 轮。清洗只去除明确的状态栏及 HTML 展示标签，保留正文和选项；特殊自定义格式请先核对预览。</Typography.Paragraph>
    </Form>
   </Modal>

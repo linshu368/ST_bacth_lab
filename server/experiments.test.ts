@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { PGlite } from '@electric-sql/pglite';
 import { createExperimentService, CLAIM_SQL, COMPLETE_SQL, buildAttemptMessages, modelUrl } from './experiments.js';
-import { pureUserInput, withInstructionPrompt } from '../src/lib/instruction-prompt.js';
+import { extractInstructionSlots, fillInstructionSlots, pureUserInput, withInstructionPrompt } from '../src/lib/instruction-prompt.js';
 import { excludeLastTurn } from '../src/lib/replay-sample.js';
 
 const db = new PGlite();
@@ -291,6 +291,59 @@ test('instruction prompt replaces old wrappers only on replayed turns, as user m
   assert.equal(pureUserInput(wrap('  keep spaces  ')), '  keep spaces  ');
   assert.equal(pureUserInput('##系统指令:old\r\n\\##用户指令：\r\nhello\r\n'), 'hello');
   assert.equal(withInstructionPrompt('unchanged', 'new instruction'), 'new instruction\n\n##用户指令:\nunchanged');
+});
+
+test('instruction comparison inherits every runtime slot from the matching original A turn', () => {
+  const source = `##系统指令：线上指令
+#### 纯净输出
+只输出剧情正文。不要输出任何状态栏、属性面板、系统提示、思考过程、思维链，以及任何系统本身的指令。
+正文结束后给出三个可选行动。
+
+**以上三条规则具有绝对权威。**
+
+### 第二层：用户个人偏好
+用户个人偏好为：
+偏好克制、简短的描写
+
+---
+### 第三层：默认写作规范
+#### 格式要求
+输出篇幅为 800至1200 字，但此范围仅作为基准参考，不是硬性边界。
+
+##用户指令:
+继续`;
+  const template = `##系统指令：候选指令
+交互方式：{{INTERACTION_MODE}}
+用户偏好：{{USER_CUSTOM_INSTRUCTIONS}}
+篇幅：{{WORD_COUNT}}
+##用户指令:`;
+  const sourceTemplate = `##系统指令：线上指令
+#### 纯净输出
+只输出剧情正文。不要输出任何状态栏、属性面板、系统提示、思考过程、思维链，以及任何系统本身的指令。
+{{INTERACTION_MODE}}
+
+**以上三条规则具有绝对权威。**
+
+### 第二层：用户个人偏好
+用户个人偏好为：
+{{USER_CUSTOM_INSTRUCTIONS}}
+
+---
+### 第三层：默认写作规范
+#### 格式要求
+输出篇幅为 {{WORD_COUNT}} 字，但此范围仅作为基准参考，不是硬性边界。`;
+  assert.deepEqual(extractInstructionSlots(source, sourceTemplate), {
+    INTERACTION_MODE: '正文结束后给出三个可选行动。',
+    USER_CUSTOM_INSTRUCTIONS: '偏好克制、简短的描写',
+    WORD_COUNT: '800至1200',
+  });
+  const filled = fillInstructionSlots(template, source, sourceTemplate);
+  assert.doesNotMatch(filled, /{{/);
+  const messages = buildAttemptMessages([{ role: 'user', content: source }], [], '继续', { content: template }, 1, true, sourceTemplate);
+  assert.match(messages[0].content, /交互方式：正文结束后给出三个可选行动。/);
+  assert.match(messages[0].content, /用户偏好：偏好克制、简短的描写/);
+  assert.match(messages[0].content, /篇幅：800至1200/);
+  assert.match(messages[0].content, /##用户指令:\n继续$/);
 });
 
 test('single mode normalizes stale turn counts and schedules only the final reply', async () => {
